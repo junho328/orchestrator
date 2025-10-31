@@ -1,0 +1,92 @@
+defaults:
+  - override /model_cfg@_global_: qwen7bi
+  - override /data_cfg@_global_: conductor_mixcd
+  - override /trainer_cfg@_global_: conductor_grpo
+  - _self_
+
+router_question_format_style: v0_random_names_2
+
+# settings for fast debugging
+per_device_train_batch_size: 4
+train_batch_size: 128
+num_generations: 4
+
+make_dataset_fn:
+  data_limit: 1000
+  countdown_ratio: 1.0
+
+reward_fns:
+  chunk_size: 1
+
+# VLLM settings for single GPU
+vllm_gpu_memory_utilization: 0.7
+vllm_tensor_parallel_size: 1
+use_vllm: true
+vllm_mode: colocate
+
+logging_prob: 1.0  # Log everything for debugging
+
+### b200 service info ###
+b200_ports:
+  google/gemma-3-27b-it: 8322
+  meta-llama/Llama-3.1-8B-Instruct: 8321
+  Qwen/Qwen2.5-32B-Instruct: 8323
+  deepseek-ai/DeepSeek-R1-Distill-Qwen-32B: 8324
+
+b200_models:
+  - "google/gemma-3-27b-it"
+  - "meta-llama/Llama-3.1-8B-Instruct"
+  - "Qwen/Qwen2.5-32B-Instruct"
+  - "deepseek-ai/DeepSeek-R1-Distill-Qwen-32B"
+
+b200_server: "poc-b200-grp01-jkz0"
+### b200 service info ###
+
+### local vllm service info ###
+open_ports:
+  google/gemma-3-27b-it: 8326
+  meta-llama/Llama-3.1-8B-Instruct: 8327
+  Qwen/Qwen2.5-32B-Instruct: 8324
+  deepseek-ai/DeepSeek-R1-Distill-Qwen-32B: 8325
+
+local_servers:
+  google/gemma-3-27b-it: "localhost"
+  meta-llama/Llama-3.1-8B-Instruct: "localhost"
+  Qwen/Qwen2.5-32B-Instruct: "localhost"
+  deepseek-ai/DeepSeek-R1-Distill-Qwen-32B: "localhost"
+### local vllm service info ###
+
+random_names:
+  - Giraffe
+  - Leopard
+  - Kangaroo
+  - Deer
+
+# saving: 
+save_strategy: steps
+save_steps: 25
+push_to_hub: false
+tags:
+
+# logging:
+logging_strategy: steps
+logging_steps: 1
+report_to: null
+wandb_project: conductor_experiments
+wandb_group_name: conductor_countdown/qwen3bi
+wandb_run_name: conductor_grpo
+
+# dirs:
+results_dir: results
+exp_name: ${now:%Y.%m.%d}${now:%H%M%S}
+output_dir: ${results_dir}/debug/${wandb_run_name}
+
+# in case output dir exists, resume_from will be ignored
+resume_from:
+
+seed: 42
+
+hydra:
+  run:
+    dir: ${output_dir}
+

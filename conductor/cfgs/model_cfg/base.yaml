@@ -1,0 +1,45 @@
+model_log_name:
+model_name_or_path:
+tokenizer_name_or_path: ${model_name_or_path}
+
+model_args:
+  _target_: hydra_utils.trl.ModelConfig
+  model_name_or_path: ${model_name_or_path}
+  trust_remote_code: true
+  use_peft: ${use_peft}
+  load_in_4bit: ${load_in_4bit}
+
+use_peft: false
+load_in_4bit: false
+
+# other available options (for reference)
+
+# model_revision: "main"
+# torch_dtype: null
+# attn_implementation: null
+# use_peft: false
+# lora_r: 16
+# lora_alpha: 32
+# lora_dropout: 0.05
+# lora_target_modules: null
+# lora_modules_to_save: null
+# lora_task_type: "CAUSAL_LM"
+# use_rslora: false
+# load_in_8bit: false
+# load_in_4bit: false
+# bnb_4bit_quant_type: "nf4"
+# use_bnb_nested_quant: false
+
+tokenizer:
+  _target_: hydra_utils.transformers.AutoTokenizer.from_pretrained
+  pretrained_model_name_or_path: ${tokenizer_name_or_path}
+  trust_remote_code: true
+
+make_tokenizer_fn:
+  _target_: hydra_utils.fix_pad_token
+  tokenizer: ${tokenizer}
+  model_name: ${model_name_or_path}
+
+peft_config:
+    _target_: hydra_utils.trl.get_peft_config
+    model_args: ${model_args}

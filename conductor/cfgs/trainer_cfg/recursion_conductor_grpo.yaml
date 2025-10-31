@@ -1,0 +1,34 @@
+defaults:
+  - conductor_grpo
+  - _self_
+
+trainer_log_name: recursion_conductor_grpo
+
+train_recursion_rounds: 2
+normalize_rewards_per_recursion_round: false
+eval_recursion_rounds: 2
+recursion_discount_factor: 0.2
+
+recursion_question_format: v0
+max_recursion_worker_response_length: null
+max_number_of_recursion_routing_steps: 5
+use_recursion_transition_payoff: false
+
+recursion_round_processor:
+  _target_: custom_data.recursion_utils.make_recursion_round_processor
+  tokenizer: ${tokenizer}
+  recursion_question_format: ${recursion_question_format}
+  max_worker_response_length: ${max_recursion_worker_response_length}
+  max_number_of_routing_steps: ${max_number_of_recursion_routing_steps}
+
+reward_fns:
+  cache_final_response: true
+
+trainer:
+  _target_: trainers.conductor_recursion_engine.gufrecursionGRPOTrainer
+  train_recursion_rounds: ${train_recursion_rounds}
+  normalize_rewards_per_recursion_round: ${normalize_rewards_per_recursion_round}
+  eval_recursion_rounds: ${eval_recursion_rounds}
+  recursion_discount_factor: ${recursion_discount_factor}
+  recursion_round_processor: ${recursion_round_processor}
+  use_recursion_transition_payoff: ${use_recursion_transition_payoff}

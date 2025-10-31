@@ -1,0 +1,99 @@
+defaults:
+  - run_conductor_base
+  - _self_
+
+model_name_or_path: Qwen/Qwen2.5-7B-Instruct
+
+router_question_format_style: v1_7c2_2
+access_history_type: binary
+user_content_format: include_overall_task
+model_id_format: numeric
+max_prompt_length: 8192
+max_agent_tokens: 4096
+
+per_device_train_batch_size: 4
+
+vllm_gpu_memory_utilization: 0.5
+vllm_tensor_parallel_size: 1
+use_vllm: true
+vllm_mode: colocate
+vllm_guided_decoding_regex: null
+vllm_server_timeout: 3600
+
+chunk_size: 10
+format_bonus: 0.5
+anthropic_platform: bedrock
+gemini_thinking_budget: 128
+
+logging_prob: 1.0  # Log everything for debugging
+
+task_module: guf.tasks.mix_m_m_r_l
+task_class: MixMMRLTask # from task_module
+use_guf: true # toggle to use guf for the task module
+
+training_tasks:
+  - "mmlu"
+  - "math500"
+  - "rlpr"
+  - "livecodebench"
+
+
+# saving: 
+save_strategy: steps
+save_steps: 20
+push_to_hub: false
+tags:
+
+### b200 service info ###
+b200_ports:
+  google/gemma-3-27b-it: 8323
+  deepseek-ai/DeepSeek-R1-Distill-Qwen-32B: 8322
+  Qwen/Qwen3-32B-Direct: 8321
+  Qwen/Qwen3-32B-Reasoning: 8324
+
+closed_models:
+  - "gemini-2.5-pro"
+  - "claude-sonnet-4-20250514"
+  - "gpt-5"
+
+b200_models:
+  - "Qwen/Qwen3-32B-Direct"
+  - "google/gemma-3-27b-it"
+  - "Qwen/Qwen3-32B-Reasoning"
+  - "deepseek-ai/DeepSeek-R1-Distill-Qwen-32B"
+
+# b200_models: []
+
+old_b200_models:
+  - "meta-llama/Llama-3.1-8B-Instruct"
+  - "google/gemma-3-27b-it"
+  - "Qwen/Qwen2.5-32B-Instruct"
+  - "deepseek-ai/DeepSeek-R1-Distill-Qwen-32B"
+
+servers: "slurm0us-a3nodeset-3"
+
+# logging:
+logging_strategy: steps
+logging_steps: 1
+report_to: wandb
+wandb_project: conductor_experiments_mix_mmrl
+wandb_group_name: conductor_mix_mmrl/qwen7bi
+wandb_run_name: conductor_grpo_qwen7bi_agenttemp0.2_v1_7c_maxtoken4k_think2k
+
+# dirs:
+results_dir: results
+exp_name: ${now:%Y.%m.%d}${now:%H%M%S}
+output_dir: ${results_dir}/${wandb_group_name}/${wandb_run_name}/${exp_name}
+
+# in case output dir exists, resume_from will be ignored
+resume_from:
+
+evaluate_only: false
+use_custom_checkpoint: null
+
+seed: 42
+
+hydra:
+  run:
+    dir: ${output_dir}
+

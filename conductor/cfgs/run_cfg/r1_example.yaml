@@ -1,0 +1,40 @@
+defaults:
+  - override /model_cfg@_global_: qwen7bi
+  - override /data_cfg@_global_: r1_countdown
+  - override /trainer_cfg@_global_: grpo
+  - _self_
+
+
+max_steps: 200
+
+train_batch_size: 256
+per_device_train_batch_size: 1
+# num_generations now divides the batch_size
+num_generations: 64
+
+save_strategy: 'no'
+save_steps: 25
+push_to_hub: false
+tags:
+
+temperature: 1.0
+
+# lower lr and beta from deepseek math paper
+learning_rate: 0.000003
+beta: 0.001
+
+vllm_gpu_memory_utilization: 0.5
+vllm_tensor_parallel_size: 1
+use_vllm: true
+vllm_mode: colocate
+
+max_prompt_length: 4096
+max_completion_length: 1024
+
+# logging:
+logging_strategy: steps
+logging_steps: 1
+
+report_to: "wandb"
+wandb_project: r1_countdown
+

@@ -1,0 +1,28 @@
+{
+  "server": {
+    "host": "0.0.0.0",
+    "port": 8081,
+    "log_level": "INFO",
+    "api_key_required": false,
+    "cors_enabled": true,
+    "max_request_size": 100
+  },
+  "engines": [
+    {
+      "name": "simple-engine",
+      "engine_type": "single",
+      "config":{
+        "model_name": "gpt-5",
+        "model_type": "openai",
+        "generation_config": {
+          "max_new_token": 4000,
+          "thinking_budget": 0,
+          "temperature": 0.1
+        }
+      }
+    }
+  ],
+  "logging": {
+    "log_dir": "./logs/server_logs"
+  }
+}

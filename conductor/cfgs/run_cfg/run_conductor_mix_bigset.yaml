@@ -1,0 +1,76 @@
+defaults:
+  - run_conductor_base
+  - _self_
+
+
+# NOTE: run file might be outdated/to delete
+
+model_name_or_path: Qwen/Qwen2.5-7B-Instruct
+
+
+### IMPORTANT ###
+### if user_content_format is "no_overall_task" then router_question_format_style in conductor_countdown.yaml is v0_2
+### if user_content_format is "include_overall_task" then router_question_format_style in conductor_countdown.yaml is v0
+### if router_question_format is v0_random_names(2) then model_id_format is random_names
+router_question_format_style: v0_c_3
+user_content_format: include_overall_task
+model_id_format: numeric
+
+task_module: guf.tasks.mix_m_c_m_j_m_r_l
+task_class: MixMCMJMRLTask
+
+training_tasks:
+  - medreason
+  - countdown
+  - math500
+  - japanese_financial
+  - mmlu
+  - rplr
+  - livecodebench
+
+
+### b200 service info ###
+b200_ports:
+  meta-llama/Llama-3.1-8B-Instruct: 8321
+  google/gemma-3-27b-it: 8322
+  Qwen/Qwen2.5-32B-Instruct: 8323
+  deepseek-ai/DeepSeek-R1-Distill-Qwen-32B: 8324
+  Qwen/Qwen3-32B-Direct: 8325
+  Qwen/Qwen3-32B-Reasoning: 8328
+
+b200_models:
+  - "Qwen/Qwen3-32B-Direct"
+  - "google/gemma-3-27b-it"
+  - "Qwen/Qwen3-32B-Reasoning"
+  - "deepseek-ai/DeepSeek-R1-Distill-Qwen-32B"
+
+
+b200_server: "poc-b200-grp01-fh83"
+servers: "poc-b200-grp01-fh83"
+### b200 service info ###
+
+### local vllm service info ###
+open_ports:
+  google/gemma-3-27b-it: 8326
+  meta-llama/Llama-3.1-8B-Instruct: 8327
+  Qwen/Qwen2.5-32B-Instruct: 8324
+  deepseek-ai/DeepSeek-R1-Distill-Qwen-32B: 8325
+
+local_servers:
+  google/gemma-3-27b-it: "localhost"
+  meta-llama/Llama-3.1-8B-Instruct: "localhost"
+  Qwen/Qwen2.5-32B-Instruct: "localhost"
+  deepseek-ai/DeepSeek-R1-Distill-Qwen-32B: "localhost"
+### local vllm service info ###
+
+random_names:
+  - Kangaroo
+  - Deer
+  - Giraffe
+  - Leopard
+
+
+wandb_project: conductor_experiments2_mix_dmrl
+wandb_group_name: conductor_mix_dmrp/qwen7bi
+wandb_run_name: conductor_grpo_qwen7bi_fast_binaccess_hidenames_1rep_16chunk_noalldefault_temp0.2_v0c2_beta0
+

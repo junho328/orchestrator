@@ -1,0 +1,13 @@
+2025-08-19 02:13:02,269 - server.logging_config - INFO - logging_config.py:81 - Logging initialized. Log file: server_logs/oai_server_20250819_021302.log
+2025-08-19 02:13:02,269 - server.logging_config - INFO - logging_config.py:82 - Log level: INFO
+2025-08-19 02:13:02,283 - server.logging_config - INFO - main.py:73 - Initializing OAI-compatible model server...
+2025-08-19 02:13:02,288 - server.logging_config - INFO - main.py:88 - Initializing model engines...
+2025-08-19 02:13:02,295 - server.logging_config - WARNING - main.py:91 - No engines configured - server will have no models available
+2025-08-19 02:13:02,306 - server.logging_config - INFO - main.py:145 - API server initialized
+2025-08-19 02:13:02,310 - server.logging_config - INFO - main.py:164 - Health checks configured
+2025-08-19 02:13:02,315 - server.logging_config - INFO - main.py:84 - Server initialization complete
+2025-08-19 02:13:02,326 - server.logging_config - INFO - main.py:181 - Starting server on 0.0.0.0:8080
+2025-08-19 02:13:02,436 - server.api - INFO - api.py:80 - Starting up OAI-compatible server...
+2025-08-19 02:13:02,436 - server.api - INFO - api.py:82 - All engines loaded successfully
+2025-08-19 02:14:19,185 - server.api - INFO - api.py:87 - Shutting down OAI-compatible server...
+2025-08-19 02:14:19,185 - server.api - INFO - api.py:89 - All engines unloaded

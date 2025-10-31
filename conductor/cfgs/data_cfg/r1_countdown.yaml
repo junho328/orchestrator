@@ -1,0 +1,20 @@
+defaults:
+  - base
+  - _self_ 
+
+data_log_name: r1_countdown_${dataset_prompt_style}_${data_limit}
+
+dataset_id_or_path: Jiayi-Pan/Countdown-Tasks-3to4
+
+dataset_prompt_style: reproduce
+data_limit: 50000
+
+make_dataset_fn:
+  _target_: custom_data.countdown_data.make_datasets
+  data_limit: ${data_limit}
+  style: ${dataset_prompt_style}
+  seed: ${seed}
+
+
+reward_fns:
+  _target_: custom_data.countdown_data.make_reward_functions

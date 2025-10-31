@@ -1,0 +1,16 @@
+statsmodels
+docx
+bs4
+seaborn
+gensim
+faker
+Levenshtein
+pyquery
+cryptography
+xlwt
+tensorflow
+keras
+openpyxl
+soundfile
+flask
+wordcloud

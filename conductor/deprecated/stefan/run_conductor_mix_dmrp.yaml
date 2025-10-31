@@ -1,0 +1,95 @@
+defaults:
+  - override /model_cfg@_global_: qwen7bi
+  - override /data_cfg@_global_: conductor_mix_dmrp
+  - override /trainer_cfg@_global_: conductor_grpo
+  - _self_
+
+
+### IMPORTANT ###
+### if user_content_format is "no_overall_task" then router_question_format_style in conductor_countdown.yaml is v0_2
+### if user_content_format is "include_overall_task" then router_question_format_style in conductor_countdown.yaml is v0
+### if router_question_format is v0_random_names(2) then model_id_format is random_names
+router_question_format_style: v0_c_2
+user_content_format: include_overall_task
+model_id_format: numeric
+
+apply_filtering: false
+data_limit: 3200
+test_ratio: 0.5 # gives us the desired 1600 total filtered samples i.e 400 per task
+
+
+vllm_gpu_memory_utilization: 0.5
+vllm_tensor_parallel_size: 1
+use_vllm: true
+vllm_mode: colocate
+
+logging_prob: 1.0  # Log everything for debugging
+
+training_tasks:
+  - deepmath
+  - mmlu
+  - polaris
+  - rlpr
+
+# saving: 
+save_strategy: steps
+save_steps: 20
+push_to_hub: false
+tags:
+
+### b200 service info ###
+b200_ports:
+  meta-llama/Llama-3.1-8B-Instruct: 8321
+  google/gemma-3-27b-it: 8322
+  Qwen/Qwen2.5-32B-Instruct: 8323
+  deepseek-ai/DeepSeek-R1-Distill-Qwen-32B: 8324
+  Qwen/Qwen3-32B-Direct: 8325
+  Qwen/Qwen3-32B-Reasoning: 8328
+
+b200_models:
+  - "Qwen/Qwen3-32B-Direct"
+  - "google/gemma-3-27b-it"
+  - "Qwen/Qwen3-32B-Reasoning"
+  - "deepseek-ai/DeepSeek-R1-Distill-Qwen-32B"
+
+old_b200_models:
+  - "meta-llama/Llama-3.1-8B-Instruct"
+  - "google/gemma-3-27b-it"
+  - "Qwen/Qwen2.5-32B-Instruct"
+  - "deepseek-ai/DeepSeek-R1-Distill-Qwen-32B"
+
+b200_models: []
+
+# b200_models:
+#   - "meta-llama/Llama-3.1-8B-Instruct"
+#   - "google/gemma-3-27b-it"
+#   - "Qwen/Qwen2.5-32B-Instruct"
+#   - "deepseek-ai/DeepSeek-R1-Distill-Qwen-32B"
+
+servers: "b200-vm01"
+
+# logging:
+logging_strategy: steps
+logging_steps: 1
+report_to: wandb
+wandb_project: conductor_experiments2_mix_dmrp
+wandb_group_name: conductor_mix_dmrp/qwen7bi
+wandb_run_name: conductor_grpo_qwen7bi_binaccess_hidenames_1rep_16chunk_noalldefault_temp0.2_v0c3_beta0
+
+# dirs:
+results_dir: results
+exp_name: ${now:%Y.%m.%d}${now:%H%M%S}
+output_dir: ${results_dir}/${wandb_group_name}/${wandb_run_name}/${exp_name}
+
+# in case output dir exists, resume_from will be ignored
+resume_from:
+
+evaluate_only: false
+use_custom_checkpoint: null
+
+seed: 42
+
+hydra:
+  run:
+    dir: ${output_dir}
+

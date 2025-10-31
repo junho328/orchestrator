@@ -1,0 +1,30 @@
+defaults:
+  - base
+  - _self_
+
+data_limit: 50000
+data_log_name: mix_cd_router_${data_limit}
+slice_test_dataset: 0
+deterministic_split: false
+evaluate_only: false
+eval_max_samples: -1
+finetune: false
+enable_thinking: false
+max_model_length: 8192
+
+make_dataset_fn:
+  _target_: custom_data.dataset.make_dataset
+  task_module: ${task_module}
+  class_name: ${task_class}
+  seed: ${seed}
+  max_number_or_routing_steps: 5
+  prompt_template: ${router_question_format_style}
+  open_models: ${b200_models}
+  closed_models: ${closed_models}
+  evaluate_only: ${evaluate_only}
+  eval_max_samples: ${eval_max_samples}
+  max_model_length: ${max_model_length}
+  finetune: ${finetune}
+  tokenizer_kwargs:
+    chat_template_kwargs:
+      enable_thinking: ${enable_thinking}

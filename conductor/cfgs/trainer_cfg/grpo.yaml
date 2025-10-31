@@ -1,0 +1,119 @@
+defaults:
+  - base
+  - _self_
+
+trainer_log_name: grpo
+
+max_steps: 200
+train_batch_size: 256
+per_device_train_batch_size: 4
+
+# Model and data preprocessing
+model_init_kwargs: null
+disable_dropout: false
+remove_unused_columns: false
+shuffle_dataset: true
+
+# Generation settings
+num_generations: 64
+max_prompt_length: 256
+max_completion_length: 1024
+ds3_gather_for_generation: true
+generation_batch_size: null
+steps_per_generation: null
+temperature: 1.0
+top_p: 1.0
+top_k: null
+min_p: null
+repetition_penalty: 1.0
+cache_implementation: null
+
+# vLLM settings
+use_vllm: true
+vllm_mode: colocate
+vllm_guided_decoding_regex: null
+vllm_server_base_url: null
+vllm_server_host: "0.0.0.0"
+vllm_server_port: 8000
+vllm_server_timeout: 240.0
+vllm_gpu_memory_utilization: 0.5
+vllm_tensor_parallel_size: 1
+
+# Optimization parameters
+learning_rate: 0.000001
+beta: 0.001
+num_iterations: 1
+epsilon: 0.2
+delta: null
+epsilon_high: null
+
+# Reward and loss configuration
+reward_weights: null
+scale_rewards: true
+loss_type: bnpo
+mask_truncated_completions: false
+
+# Reference-model synchronization
+sync_ref_model: false
+ref_model_mixup_alpha: 0.9
+ref_model_sync_steps: 64
+use_liger_loss: false
+
+# Logging parameters
+log_completions: false
+num_completions_to_print: null
+wandb_log_unique_prompts: false
+push_to_hub: false
+
+trainer_args:
+  _target_: trl.GRPOConfig
+  model_init_kwargs: ${model_init_kwargs}
+  disable_dropout: ${disable_dropout}
+  remove_unused_columns: ${remove_unused_columns}
+  shuffle_dataset: ${shuffle_dataset}
+  max_prompt_length: ${max_prompt_length}
+  num_generations: ${num_generations}
+  max_completion_length: ${max_completion_length}
+  ds3_gather_for_generation: ${ds3_gather_for_generation}
+  generation_batch_size: ${generation_batch_size}
+  steps_per_generation: ${steps_per_generation}
+  temperature: ${temperature}
+  top_p: ${top_p}
+  top_k: ${top_k}
+  min_p: ${min_p}
+  repetition_penalty: ${repetition_penalty}
+  cache_implementation: ${cache_implementation}
+  use_vllm: ${use_vllm}
+  vllm_mode: ${vllm_mode}
+  vllm_guided_decoding_regex: ${vllm_guided_decoding_regex}
+  vllm_server_base_url: ${vllm_server_base_url}
+  vllm_server_host: ${vllm_server_host}
+  vllm_server_port: ${vllm_server_port}
+  vllm_server_timeout: ${vllm_server_timeout}
+  vllm_gpu_memory_utilization: ${vllm_gpu_memory_utilization}
+  vllm_tensor_parallel_size: ${vllm_tensor_parallel_size}
+  learning_rate: ${learning_rate}
+  beta: ${beta}
+  num_iterations: ${num_iterations}
+  epsilon: ${epsilon}
+  delta: ${delta}
+  epsilon_high: ${epsilon_high}
+  reward_weights: ${reward_weights}
+  scale_rewards: ${scale_rewards}
+  loss_type: ${loss_type}
+  mask_truncated_completions: ${mask_truncated_completions}
+  sync_ref_model: ${sync_ref_model}
+  ref_model_mixup_alpha: ${ref_model_mixup_alpha}
+  ref_model_sync_steps: ${ref_model_sync_steps}
+  use_liger_loss: ${use_liger_loss}
+  log_completions: ${log_completions}
+  num_completions_to_print: ${num_completions_to_print}
+  wandb_log_unique_prompts: ${wandb_log_unique_prompts}
+  push_to_hub: ${push_to_hub}
+  max_steps: ${max_steps}
+  per_device_train_batch_size: ${per_device_train_batch_size}
+
+trainer:
+  _target_: trainers.conductor_engine.CustomGRPOTrainer
+  reward_funcs: ${reward_fns}
+  args: ${trainer_args}

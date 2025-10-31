@@ -1,0 +1,14 @@
+defaults:
+  - run_conductor_base
+  - _self_
+
+model_name_or_path: Qwen/Qwen2.5-7B-Instruct
+
+task_module: guf.tasks.livecodebench
+task_class: LiveCodeBenchTask # from task_module
+
+training_tasks:
+  - "livecodebench"
+
+wandb_run_name: conductor_grpo_qwen7bi_agenttemp0.2_v1_7_beta0_cost0
+

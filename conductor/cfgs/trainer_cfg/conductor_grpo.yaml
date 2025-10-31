@@ -1,0 +1,67 @@
+defaults:
+  - grpo
+  - _self_
+
+trainer_log_name: conductor_grpo
+logging_prob: 0.1
+
+max_prompt_length: 4096
+beta: 0.0
+max_completion_length: 1024
+
+per_device_train_batch_size: 2
+train_batch_size: 256
+num_generations: 64
+score_repeats: 1
+chunk_size: 16
+cost_bonus_weight: 0.0
+vllm_gpu_memory_utilization: 0.5
+vllm_tensor_parallel_size: 1
+use_vllm: true
+vllm_mode: colocate
+max_agent_tokens: 4096
+access_history_type: binary
+format_bonus: 0.0
+anthropic_platform: bedrock
+gemini_thinking_budget: 128
+claude_thinking_budget: 0
+gpt_reasoning_effort: minimal
+evaluate_only: false
+subtask_ablation: false
+non_chain_bonus: 0.0
+final_agent_knowledge: false
+
+# Set Conductor rewards
+reward_fns:
+  _target_: trainers.conductor_engine.ConductorReward
+  closed_models: ${closed_models}
+  open_models: ${b200_models}
+  ports: ${b200_ports}
+  max_tokens: ${max_agent_tokens}
+  task_module: ${task_module}
+  task_class_name: ${task_class}
+  use_guf: ${use_guf}
+  temperature: 0.2
+  user_content_format: ${user_content_format}
+  servers: ${servers}
+  model_id_format: ${model_id_format}
+  chunk_size: ${chunk_size}
+  score_repeats: ${score_repeats}
+  training_tasks: ${training_tasks}
+  cost_bonus_weight: ${cost_bonus_weight}
+  non_chain_bonus: ${non_chain_bonus}
+  coordination_log_dir: ${output_dir}
+  access_history_type: ${access_history_type}
+  format_bonus: ${format_bonus}
+  final_agent_knowledge: ${final_agent_knowledge}
+  anthropic_platform: ${anthropic_platform}
+  gemini_thinking_budget: ${gemini_thinking_budget}
+  claude_thinking_budget: ${claude_thinking_budget}
+  evaluate_only: ${evaluate_only}
+  gpt_reasoning_effort: ${gpt_reasoning_effort}
+  subtask_ablation: ${subtask_ablation}
+trainer:
+  _target_: trainers.conductor_engine.gufGRPOTrainer
+  reward_funcs: ${reward_fns}
+  args: ${trainer_args}
+  logging_prob: ${logging_prob}

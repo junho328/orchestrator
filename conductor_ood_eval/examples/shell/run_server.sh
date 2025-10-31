@@ -1,0 +1,1 @@
+CUDA_VISIBLE_DEVICES=2 python main.py --config configs/inception_v1_7c22_finetune.json

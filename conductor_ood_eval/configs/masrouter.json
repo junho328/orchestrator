@@ -1,0 +1,35 @@
+{
+  "server": {
+    "host": "0.0.0.0",
+    "port": 8083,
+    "log_level": "INFO",
+    "api_key_required": false,
+    "cors_enabled": true,
+    "max_request_size": 40
+  },
+  "engines": [
+    {
+      "name": "masrouter-engine",
+      "engine_type": "custom",
+      "is_default": true,
+      "config": {
+        "engine_module": "masrouter_engine",
+        "engine_class": "MASRouterEngine",
+        "model_path": "your/path/here",
+        "debug": false,
+        "server_host": "b200-vm01",
+        "open_agents": {
+          "Qwen/Qwen3-32B-Direct": { "port": 8325 },
+          "google/gemma-3-27b-it": { "port": 8322 },
+          "Qwen/Qwen3-32B-Reasoning": { "port": 8328 },
+          "deepseek-ai/DeepSeek-R1-Distill-Qwen-32B": { "port": 8324 }
+        },
+        "closed_agents": {
+        }
+      }
+    }
+  ],
+  "logging": {
+    "log_dir": "./logs"
+  }
+}

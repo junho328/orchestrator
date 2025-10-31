@@ -1,0 +1,40 @@
+{
+  "server": {
+    "host": "0.0.0.0",
+    "port": 8083,
+    "log_level": "INFO",
+    "api_key_required": false,
+    "cors_enabled": true,
+    "max_request_size": 40
+  },
+  "engines": [
+    {
+      "name": "reflection-engine",
+      "engine_type": "custom",
+      "model_one": "deepseek-ai/DeepSeek-R1-Distill-Qwen-32B",
+      "model_two": "google/gemma-3-27b-it",
+      "is_default": true,
+      "config": {
+        "engine_module": "reflection_engine",
+        "engine_class": "ReflectionEngine",
+        "debug": false,
+        "server_host": "b200-vm01",
+        "open_agents": {
+          "meta-llama/Llama-3.1-8B-Instruct": {"port": 8321},
+          "google/gemma-3-27b-it": {"port": 8322},
+          "Qwen/Qwen2.5-32B-Instruct": {"port": 8323},
+          "deepseek-ai/DeepSeek-R1-Distill-Qwen-32B": {"port": 8324}
+        },
+        "closed_agents": {
+          "gpt-4o-mini": {"together": false},
+          "claude-3-7-sonnet-20250219": {"together": false},
+          "gemini-1.5-pro": {"together": false},
+          "deepseek-ai/DeepSeek-V3": {"together": true}
+        }
+      }
+    }
+  ],
+  "logging": {
+    "log_dir": "./logs"
+  }
+}

@@ -1,0 +1,46 @@
+{
+  "server":  { "host": "0.0.0.0", 
+      "port": 4321, 
+      "log_level": "INFO",
+      "cors_enabled": true,
+      "api_key_required": false },
+
+  "logging": { "log_dir": "./logs" },
+
+  "engines": [{
+    "name": "conductor-engine",
+    "engine_type": "conductor", 
+    "is_default": true,
+
+    "config": {
+      "model_path": "your/path/here",     
+      "debug": true,
+      "max_turns": 5,
+      "server_host": "slurm0us-a3nodeset-2",
+      "routing_format": "v1_7c2_2_ood",
+      "agent_max_tokens": 4096,
+      "mask_style": "names_and_params",
+      "clean_final_response": true,
+      "include_gemini_thoughts": false,
+      "gemini_thinking_budget": 32768,
+      "claude_thinking_budget": 32768,
+      "gpt_reasoning_effort": "high",
+      "set_out_tokens_to_max": true,
+      "anthropic_platform": "bedrock",
+      "use_gen_prefix": true,
+      "final_agent_knowledge": false,
+
+      "open_agents": {
+        "Qwen/Qwen3-32B-Direct": { "port": 8321 },
+        "google/gemma-3-27b-it": { "port": 8323 },
+        "Qwen/Qwen3-32B-Reasoning": { "port": 8324 },
+        "deepseek-ai/DeepSeek-R1-Distill-Qwen-32B": { "port": 8322 }
+      },
+      "closed_agents": {
+        "gemini-2.5-pro": { "port": null },
+        "claude-sonnet-4-20250514": { "port": null },
+        "gpt-5": { "port": null }
+      }
+    }
+  }]
+}
