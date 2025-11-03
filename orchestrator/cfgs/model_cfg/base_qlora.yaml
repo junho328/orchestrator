@@ -1,0 +1,38 @@
+defaults:
+  - base
+  - _self_
+
+model_log_name: base_qlora
+
+# Enable QLoRA
+use_peft: true
+load_in_4bit: true
+
+# QLoRA/LoRA configuration
+lora_r: 16
+lora_alpha: 32
+lora_dropout: 0.05
+lora_target_modules: null  # Auto-detect if null, or specify like ["q_proj", "v_proj", "k_proj", "o_proj"]
+lora_modules_to_save: null
+lora_task_type: "CAUSAL_LM"
+use_rslora: false
+bnb_4bit_quant_type: "nf4"
+use_bnb_nested_quant: false
+
+model_args:
+  use_peft: ${use_peft}
+  load_in_4bit: ${load_in_4bit}
+  lora_r: ${lora_r}
+  lora_alpha: ${lora_alpha}
+  lora_dropout: ${lora_dropout}
+  lora_target_modules: ${lora_target_modules}
+  lora_modules_to_save: ${lora_modules_to_save}
+  lora_task_type: ${lora_task_type}
+  use_rslora: ${use_rslora}
+  bnb_4bit_quant_type: ${bnb_4bit_quant_type}
+  use_bnb_nested_quant: ${use_bnb_nested_quant}
+
+peft_config:
+  _target_: trl.trainer.utils.get_peft_config
+  model_args: ${model_args}
+

@@ -1,0 +1,77 @@
+defaults:
+  - base
+  - _self_
+
+trainer_log_name: orchestrator_grpo
+
+logging_prob: 0.1
+
+max_prompt_length: 2048
+beta: 0.0
+max_completion_length: 2048
+
+per_device_train_batch_size: 4
+train_batch_size: 16
+num_generations: 8
+score_repeats: 1
+chunk_size: 16
+format_bonus: 0.0
+
+# Worker models configuration (inherited from data_cfg)
+
+# Set Orchestrator rewards
+reward_fns:
+  _target_: orchestrator.trainers.orchestrator_engine.OrchestratorReward
+  worker_models: ${worker_models}
+  max_tokens: 2048
+  temperature: 0.8
+  max_routing_steps: ${max_routing_steps}
+  output_dir: ${output_dir}
+  coordination_log_dir: ${output_dir}
+  chunk_size: ${chunk_size}
+  score_repeats: ${score_repeats}
+  use_local_models: true
+  device_map: auto
+  format_bonus: ${format_bonus}
+
+trainer_args:
+  _target_: trl.GRPOConfig
+  output_dir: ${output_dir}
+  num_train_epochs: ${num_train_epochs}
+  per_device_train_batch_size: ${per_device_train_batch_size}
+  gradient_accumulation_steps: ${gradient_accumulation_steps}
+  gradient_checkpointing: ${gradient_checkpointing}
+  gradient_checkpointing_kwargs: ${gradient_checkpointing_kwargs}
+  learning_rate: ${learning_rate}
+  weight_decay: ${weight_decay}
+  adam_beta1: ${adam_beta1}
+  adam_beta2: ${adam_beta2}
+  adam_epsilon: ${adam_epsilon}
+  max_grad_norm: ${max_grad_norm}
+  lr_scheduler_type: ${lr_scheduler_type}
+  lr_scheduler_kwargs: ${lr_scheduler_kwargs}
+  warmup_ratio: ${warmup_ratio}
+  logging_strategy: ${logging_strategy}
+  logging_steps: ${logging_steps}
+  save_strategy: ${save_strategy}
+  save_steps: ${save_steps}
+  report_to: ${report_to}
+  run_name: ${wandb_run_name}
+  bf16: ${bf16}
+  tf32: ${tf32}
+  seed: ${seed}
+  max_prompt_length: ${max_prompt_length}
+  max_completion_length: ${max_completion_length}
+  beta: ${beta}
+  num_generations: ${num_generations}
+
+trainer:
+  _target_: orchestrator.trainers.orchestrator_engine.CustomGRPOTrainer
+  reward_funcs: ${reward_fns}
+  args: ${trainer_args}
+  logging_prob: ${logging_prob}
+  max_prompt_length: ${max_prompt_length}
+  max_completion_length: ${max_completion_length}
+  beta: ${beta}
+  num_generations: ${num_generations}
+
