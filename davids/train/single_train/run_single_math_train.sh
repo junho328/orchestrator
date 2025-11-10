@@ -11,6 +11,7 @@ ORCHESTRATOR_DIR="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 
 # Default values
 MODEL_NAME=${MODEL_NAME:-"Qwen/Qwen2.5-Coder-7B-Instruct"}
+DATASET_NAME=${DATASET_NAME:-"jhn9803/hendrycks-math-with-answers"}
 OUTPUT_DIR=${OUTPUT_DIR:-"/ext_hdd/jhna/marllm"}
 LEARNING_RATE=${LEARNING_RATE:-1e-6}
 DTYPE=${DTYPE:-"bfloat16"}
@@ -33,7 +34,7 @@ GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-0.6}
 # LOAD_IN_8BIT=${LOAD_IN_8BIT:-""}
 
 WANDB_PROJECT=${WANDB_PROJECT:-"single-train"}
-WANDB_RUN_NAME=${WANDB_RUN_NAME:-"qwen-7b-bcb-grpo-g16"}
+WANDB_RUN_NAME=${WANDB_RUN_NAME:-"qwen-7b-math-grpo-g16"}
 
 ACCELERATE_CONFIG=${ACCELERATE_CONFIG:-"/home/jhna/orchestrator/davids/configs/deepspeed_zero.yaml"}
 

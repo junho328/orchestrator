@@ -71,7 +71,7 @@ from trl import (
 )
 from davids.train.single_train.grpo_trainer import GRPOTrainer
 from davids.reward_utils.think_answer_format_reward import think_answer_format_reward
-from davids.reward_utils.bcb_accuracy_reward import bcb_accuracy_reward
+from davids.reward_utils.math_reward import accuracy_reward
 
 
 @dataclass
@@ -99,7 +99,6 @@ if __name__ == "__main__":
     quantization_config = get_quantization_config(model_args)
     if quantization_config is not None:
         # Passing None would not be treated the same as omitting the argument, so we include it only when valid.
-        training_args.model_init_kwargs["device_map"] = get_kbit_device_map()
         training_args.model_init_kwargs["quantization_config"] = quantization_config
         # DeepSpeed Zero-3 is not compatible with device_map, so we only set it when not using DeepSpeed
         # if training_args.deepspeed is None:
@@ -111,14 +110,14 @@ if __name__ == "__main__":
     # Dataset
     ################
     
-    train_dataset = load_dataset("bigcode/bigcodebench", split="v0.1.4")
+    train_dataset = load_dataset(script_args.dataset_name, split="train")
     
     dataset_dict = train_dataset.train_test_split(test_size=script_args.eval_ratio, seed=training_args.seed)
     train_dataset = dataset_dict["train"]
     eval_dataset = dataset_dict["test"]
     
     SYSTEM_PROMPT = (
-        "You are a helpful assistant that solve complex tasks."
+        "You are a helpful assistant that solve complex math problems."
     )
 
     def make_conversation(example):
@@ -135,10 +134,9 @@ if __name__ == "__main__":
         [Your final answer here]
         </answer>
         
-        Please provide a self-contained Python script that solves the following problem in a markdown code block:
-```
-{example["instruct_prompt"]}
-```
+        Now, solve the following problem:
+
+        Problem: {example["problem"]}
 """
         
         # Extract testcase from the dataset and pass it as solution for reward function
@@ -150,7 +148,7 @@ if __name__ == "__main__":
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": user_prompt},
             ],
-            "solution": testcase,  # Pass testcase as solution for bcb_accuracy_reward
+            "solution": example["answer"],  # Pass testcase as solution for bcb_accuracy_reward
         }
 
     train_dataset = train_dataset.map(make_conversation)
@@ -172,7 +170,7 @@ if __name__ == "__main__":
     trainer = GRPOTrainer(
         model=model_args.model_name_or_path,
         args=training_args,
-        reward_funcs=[bcb_accuracy_reward, think_answer_format_reward],
+        reward_funcs=[accuracy_reward, think_answer_format_reward],
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         peft_config=peft_config,
