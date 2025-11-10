@@ -176,7 +176,6 @@ def reliability_guard(maximum_memory_bytes: Optional[int] = None):
 def safe_bcb_execute(queue: multiprocessing.Queue, program: str, testcase: str, timeout: float):
     """Safely execute the program with unittest testcase."""
     logger.info(f"Starting test execution with timeout={timeout}s")
-    logger.debug(f"Program length: {len(program)} chars, Testcase length: {len(testcase)} chars")
     
     with create_tempdir():
         # These system calls are needed when cleaning up tempdir.
@@ -318,10 +317,6 @@ def bcb_accuracy_reward(completions: list[list[dict[str, str]]], solution: list[
     """
     # Extract solution from kwargs if not provided as parameter
     if solution is None:
-        solution = kwargs.get("solution", [])
-    
-    # If solution is still empty or None, return 0.0 for all completions
-    if not solution:
         return [0.0] * len(completions)
     
     contents = [completion[0]["content"] for completion in completions]
@@ -360,7 +355,8 @@ def bcb_accuracy_reward(completions: list[list[dict[str, str]]], solution: list[
         try:
             result = get_bcb_score(test_program, testcase, timeout=60.0, completion_id=idx)
             # Convert pass_rate to binary: 1.0 if all tests pass (pass_rate == 1.0), 0.0 otherwise
-            reward = 1.0 if result['score'] == 1.0 else 0.0
+            # reward = 1.0 if result['score'] == 1.0 else 0.0 # binary reward
+            reward = result['score'] # continuous reward
             logger.info(
                 f"Completion {idx + 1}: Test result - score={result['score']:.4f}, "
                 f"status={result['status']}, reward={reward}"

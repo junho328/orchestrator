@@ -73,19 +73,22 @@ from trl import (
 from davids.reward_utils.think_answer_format_reward import think_answer_format_reward
 from davids.reward_utils.math_reward import accuracy_reward
 
-
-@dataclass
-class CustomScriptArguments(ScriptArguments):
-    """Custom script arguments extending TRL's ScriptArguments."""
-
-    eval_ratio: float = field(
-        default=0.1,
-        metadata={"help": "Ratio of dataset to use for evaluation"},
-    )
-
 if __name__ == "__main__":
-    parser = TrlParser((CustomScriptArguments, GRPOConfig, ModelConfig))
+    parser = TrlParser((ScriptArguments, GRPOConfig, ModelConfig))
     script_args, training_args, model_args = parser.parse_args_and_config()
+    
+    # Get environment variables (set in run_single_math_train.sh)
+    wandb_run_name_env = os.environ.get('WANDB_RUN_NAME')
+    wandb_project_env = os.environ.get('WANDB_PROJECT')
+    
+    # Always set run_name and project from environment variables if available
+    # This ensures they are set even if --run_name argument parsing fails
+    if wandb_run_name_env and hasattr(training_args, 'run_name'):
+        training_args.run_name = wandb_run_name_env
+    
+    if wandb_project_env and hasattr(training_args, 'project'):
+        training_args.project = wandb_project_env
+    
     ################
     # Model & Processor
     ################
@@ -99,10 +102,8 @@ if __name__ == "__main__":
     quantization_config = get_quantization_config(model_args)
     if quantization_config is not None:
         # Passing None would not be treated the same as omitting the argument, so we include it only when valid.
+        # training_args.model_init_kwargs["device_map"] = get_kbit_device_map()
         training_args.model_init_kwargs["quantization_config"] = quantization_config
-        # DeepSpeed Zero-3 is not compatible with device_map, so we only set it when not using DeepSpeed
-        # if training_args.deepspeed is None:
-        #     training_args.model_init_kwargs["device_map"] = get_kbit_device_map()
     
     peft_config = get_peft_config(model_args)
     
@@ -138,14 +139,7 @@ if __name__ == "__main__":
         Now, solve the following problem:
 
         Problem: {example["problem"]}
-        
-        Answer:
 """
-        
-        # Extract testcase from the dataset and pass it as solution for reward function
-        # BigCodeBench dataset typically has 'test' field containing unittest testcase
-        testcase = example.get("test", "")
-        
         return {
             "prompt": [
                 {"role": "system", "content": SYSTEM_PROMPT},
