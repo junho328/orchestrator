@@ -56,8 +56,8 @@ accelerate launch \
 import os
 from dataclasses import dataclass, field
 from typing import Optional
-
 import torch
+
 from datasets import load_dataset
 
 from trl import (
@@ -99,7 +99,7 @@ if __name__ == "__main__":
     quantization_config = get_quantization_config(model_args)
     if quantization_config is not None:
         # Passing None would not be treated the same as omitting the argument, so we include it only when valid.
-        training_args.model_init_kwargs["device_map"] = get_kbit_device_map()
+        # training_args.model_init_kwargs["device_map"] = get_kbit_device_map()
         training_args.model_init_kwargs["quantization_config"] = quantization_config
         # DeepSpeed Zero-3 is not compatible with device_map, so we only set it when not using DeepSpeed
         # if training_args.deepspeed is None:

@@ -68,8 +68,8 @@ from trl import (
     get_kbit_device_map,
     get_peft_config,
     get_quantization_config,
+    GRPOTrainer,
 )
-from davids.train.single_train.grpo_trainer import GRPOTrainer
 from davids.reward_utils.think_answer_format_reward import think_answer_format_reward
 from davids.reward_utils.math_reward import accuracy_reward
 
@@ -111,10 +111,11 @@ if __name__ == "__main__":
     ################
     
     train_dataset = load_dataset(script_args.dataset_name, split="train")
+    eval_dataset = load_dataset(script_args.dataset_name, split="test")
     
-    dataset_dict = train_dataset.train_test_split(test_size=script_args.eval_ratio, seed=training_args.seed)
-    train_dataset = dataset_dict["train"]
-    eval_dataset = dataset_dict["test"]
+    # dataset_dict = train_dataset.train_test_split(test_size=script_args.eval_ratio, seed=training_args.seed)
+    # train_dataset = dataset_dict["train"]
+    # eval_dataset = dataset_dict["test"]
     
     SYSTEM_PROMPT = (
         "You are a helpful assistant that solve complex math problems."
@@ -137,6 +138,8 @@ if __name__ == "__main__":
         Now, solve the following problem:
 
         Problem: {example["problem"]}
+        
+        Answer:
 """
         
         # Extract testcase from the dataset and pass it as solution for reward function
@@ -153,16 +156,6 @@ if __name__ == "__main__":
 
     train_dataset = train_dataset.map(make_conversation)
     eval_dataset = eval_dataset.map(make_conversation)
-
-    # # Remove columns but keep 'solution' for reward function
-    # # Note: 'messages' and 'problem' are removed, but 'solution' is kept to be passed to reward function
-    # columns_to_remove = ["messages", "problem"]
-    # # Also remove 'test' if it exists (we've already extracted it as 'solution')
-    # if "test" in train_dataset.column_names:
-    #     columns_to_remove.append("test")
-    
-    # train_dataset = train_dataset.remove_columns(columns_to_remove)
-    # eval_dataset = eval_dataset.remove_columns(columns_to_remove)
 
     ################
     # Training

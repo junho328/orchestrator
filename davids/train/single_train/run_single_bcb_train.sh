@@ -3,14 +3,18 @@
 
 # Set tokenizers parallelism to avoid warnings
 export TOKENIZERS_PARALLELISM=false
-export CUDA_VISIBLE_DEVICES=0,2
+# export CUDA_VISIBLE_DEVICES=0,2
+
+# Set Triton cache directory to local disk to avoid NFS quota issues
+export TRITON_CACHE_DIR=${TRITON_CACHE_DIR:-"/tmp/triton_cache_${USER}"}
+mkdir -p "$TRITON_CACHE_DIR"
 
 # Get the directory of this script
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ORCHESTRATOR_DIR="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 
 # Default values
-MODEL_NAME=${MODEL_NAME:-"Qwen/Qwen2.5-Coder-7B-Instruct"}
+MODEL_NAME=${MODEL_NAME:-"Qwen/Qwen2.5-Coder-1.5B-Instruct"}
 OUTPUT_DIR=${OUTPUT_DIR:-"/ext_hdd/jhna/marllm"}
 LEARNING_RATE=${LEARNING_RATE:-1e-6}
 DTYPE=${DTYPE:-"bfloat16"}

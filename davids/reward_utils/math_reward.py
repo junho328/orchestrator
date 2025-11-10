@@ -1,5 +1,5 @@
 import re
-from trl.imports import is_math_verify_available
+from trl.import_utils import is_math_verify_available
 
 if is_math_verify_available():
     from latex2sympy2_extended import NormalizationConfig

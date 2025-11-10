@@ -3,14 +3,14 @@
 
 # Set tokenizers parallelism to avoid warnings
 export TOKENIZERS_PARALLELISM=false
-export CUDA_VISIBLE_DEVICES=0,2
+# export CUDA_VISIBLE_DEVICES=0,2
 
 # Get the directory of this script
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ORCHESTRATOR_DIR="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 
 # Default values
-MODEL_NAME=${MODEL_NAME:-"Qwen/Qwen2.5-Coder-7B-Instruct"}
+MODEL_NAME=${MODEL_NAME:-"Qwen/Qwen2.5-Coder-1.5B-Instruct"}
 DATASET_NAME=${DATASET_NAME:-"jhn9803/hendrycks-math-with-answers"}
 OUTPUT_DIR=${OUTPUT_DIR:-"/ext_hdd/jhna/marllm"}
 LEARNING_RATE=${LEARNING_RATE:-1e-6}
@@ -19,7 +19,7 @@ MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-1024}
 MAX_COMPLETION_LENGTH=${MAX_COMPLETION_LENGTH:-1024}
 BATCH_SIZE=${BATCH_SIZE:-8}
 GRADIENT_ACCUMULATION_STEPS=${GRADIENT_ACCUMULATION_STEPS:-4}
-NUM_GENERATIONS=${NUM_GENERATIONS:-8}
+NUM_GENERATIONS=${NUM_GENERATIONS:-16}
 BETA=${BETA:-0.0}
 LORA_R=${LORA_R:-16}
 LORA_ALPHA=${LORA_ALPHA:-32}
@@ -27,14 +27,14 @@ LORA_DROPOUT=${LORA_DROPOUT:-0.0}
 LORA_TARGET_MODULES=${LORA_TARGET_MODULES:-"all-linear"}
 EVAL_RATIO=${EVAL_RATIO:-0.1}
 SEED=${SEED:-42}
-GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-0.6}
+GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-0.8}
 
 # Quantization: optional, set --load_in_4bit or --load_in_8bit if needed
 # LOAD_IN_4BIT=${LOAD_IN_4BIT:-""}
 # LOAD_IN_8BIT=${LOAD_IN_8BIT:-""}
 
-WANDB_PROJECT=${WANDB_PROJECT:-"single-train"}
-WANDB_RUN_NAME=${WANDB_RUN_NAME:-"qwen-7b-math-grpo-g16"}
+WANDB_PROJECT=${WANDB_PROJECT:-"single-math-train"}
+WANDB_RUN_NAME=${WANDB_RUN_NAME:-"qwen-1.5b-math-grpo-g16"}
 
 ACCELERATE_CONFIG=${ACCELERATE_CONFIG:-"/home/jhna/orchestrator/davids/configs/deepspeed_zero.yaml"}
 
@@ -44,8 +44,9 @@ cd "$ORCHESTRATOR_DIR"
 # Run training with accelerate
 accelerate launch \
     --config_file "$ACCELERATE_CONFIG" \
-    -m davids.train.single_train.single_bcb_train \
+    -m davids.train.single_train.single_math_train \
     --model_name_or_path "$MODEL_NAME" \
+    --dataset_name "$DATASET_NAME" \
     --output_dir "$OUTPUT_DIR" \
     --learning_rate "$LEARNING_RATE" \
     --dtype "$DTYPE" \
