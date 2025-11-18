@@ -25,6 +25,7 @@ import platform
 import subprocess
 import logging
 from typing import Optional, Dict
+from queue import Empty
 
 logger = logging.getLogger(__name__)
 
@@ -264,8 +265,12 @@ def get_bcb_score(program: str, testcase: str, timeout: float, completion_id: Op
             p.kill()
             p.join()
         logger.debug("Retrieving result from queue")
-        result_dict = q.get(timeout=timeout + 1)
-        logger.info(f"Test result retrieved: score={result_dict.get('score', 0)}, status={result_dict.get('status', 'unknown')}")
+        try:
+            result_dict = q.get(timeout=timeout + 1)
+            logger.info(f"Test result retrieved: score={result_dict.get('score', 0)}, status={result_dict.get('status', 'unknown')}")
+        except Empty:
+            logger.warning("Queue is empty - process may have crashed or been killed before putting result")
+            result_dict = {'score': 0, 'status': 'queue_empty'}
 
     except Exception as e:
         logger.error(f"Error in get_bcb_score: {str(e)}", exc_info=True)

@@ -15,12 +15,11 @@
 import inspect
 import os
 import textwrap
-import warnings
 from collections import defaultdict, deque
 from contextlib import nullcontext
 from functools import partial
 from pathlib import Path
-from typing import Any, Callable, Optional, Union
+from typing import Any, Callable, Optional, Union, List
 
 import datasets
 import torch
@@ -42,19 +41,12 @@ from transformers import (
     PreTrainedTokenizerBase,
     ProcessorMixin,
     TrainerCallback,
-    is_trackio_available,
     is_wandb_available,
 )
 from transformers.trainer_utils import seed_worker
-from transformers.utils import is_datasets_available, is_peft_available, is_rich_available
+from transformers.utils import is_datasets_available, is_flash_attn_2_available, is_peft_available, is_rich_available
 
-from trl.data_utils import (
-    apply_chat_template,
-    is_conversational,
-    prepare_multimodal_messages,
-    prepare_multimodal_messages_vllm,
-)
-import re
+from trl.data_utils import apply_chat_template, is_conversational, maybe_apply_chat_template, prepare_multimodal_messages
 from trl.extras.profiling import profiling_context, profiling_decorator
 from trl.extras.vllm_client import VLLMClient
 from trl.import_utils import is_liger_kernel_available, is_vllm_available
@@ -68,7 +60,6 @@ from trl.trainer.utils import (
     disable_dropout_in_model,
     ensure_master_addr_port,
     entropy_from_logits,
-    get_config_model_id,
     identity,
     nanmax,
     nanmin,
@@ -81,6 +72,8 @@ from trl.trainer.utils import (
     split_tensor_dict,
     unsplit_pixel_values_by_grid,
 )
+
+from davids.train.utils.orchestrator_prompt import parse_orchestrator_output
 
 
 if is_peft_available():
@@ -96,9 +89,6 @@ if is_vllm_available():
 if is_wandb_available():
     import wandb
 
-if is_trackio_available():
-    import trackio
-
 
 logger = logging.get_logger(__name__)
 
@@ -106,13 +96,8 @@ logger = logging.get_logger(__name__)
 # rewards. When it's a string, it's a model ID, so it's loaded as a pretrained model.
 RewardFunc = Union[str, PreTrainedModel, Callable[[list, list], list[float]]]
 
-# What we call a rollout function is a callable that takes prompts (list), args (GRPOConfig), and processing_class as
-# parameters and returns a dict of generation results. Those results must include "prompt_ids", "completion_ids", and
-# "logprobs" fields. Any extra fields (per-completion) are forwarded to the reward functions.
-RolloutFunc = Callable[[list[str], Any, Any], dict[str, Any]]
 
-
-class GRPOTrainer(BaseTrainer):
+class MultiGRPOTrainer(BaseTrainer):
     """
     Trainer for the Group Relative Policy Optimization (GRPO) method. This algorithm was initially proposed in the
     paper [DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language
@@ -212,11 +197,6 @@ class GRPOTrainer(BaseTrainer):
             model and a scheduler given by [`get_linear_schedule_with_warmup`] controlled by `args`.
         peft_config ([`~peft.PeftConfig`], *optional*):
             PEFT configuration used to wrap the model. If `None`, the model is not wrapped.
-        rollout_func (`RolloutFunc`, *optional*):
-            Function to use for generating completions. It must take prompts, args, and processing_class as parameters
-            and return a dict with `"prompt_ids"`, `"completion_ids"`, and `"logprobs"` fields. Any other fields that
-            are forwarded to the reward functions. This feature is experimental and may change or be removed at any
-            time without prior notice.
     """
 
     _tag_names = ["trl", "grpo"]
@@ -247,11 +227,10 @@ class GRPOTrainer(BaseTrainer):
         callbacks: Optional[list[TrainerCallback]] = None,
         optimizers: tuple[Optional[torch.optim.Optimizer], Optional[torch.optim.lr_scheduler.LambdaLR]] = (None, None),
         peft_config: Optional["PeftConfig"] = None,
-        rollout_func: Optional[RolloutFunc] = None,
     ):
         # Args
         if args is None:
-            model_name = model if isinstance(model, str) else get_config_model_id(model.config)
+            model_name = model if isinstance(model, str) else model.config._name_or_path
             model_name = model_name.split("/")[-1]
             args = GRPOConfig(f"{model_name}-GRPO")
 
@@ -276,7 +255,7 @@ class GRPOTrainer(BaseTrainer):
             architecture = getattr(transformers, config.architectures[0])
             model = architecture.from_pretrained(model_id, **model_init_kwargs)
         else:
-            model_id = get_config_model_id(model.config)
+            model_id = model.config._name_or_path
             if args.model_init_kwargs is not None:
                 logger.warning(
                     "You passed `model_init_kwargs` to the `GRPOConfig`, but your model is already instantiated. "
@@ -296,7 +275,7 @@ class GRPOTrainer(BaseTrainer):
 
         # Processing class
         if processing_class is None:
-            processing_class = AutoProcessor.from_pretrained(get_config_model_id(model.config), truncation_side="left")
+            processing_class = AutoProcessor.from_pretrained(model.config._name_or_path, truncation_side="left")
 
         # Handle pad token for processors or tokenizers
         if isinstance(processing_class, ProcessorMixin):
@@ -323,7 +302,7 @@ class GRPOTrainer(BaseTrainer):
                     reward_func, num_labels=1, **model_init_kwargs
                 )
             if isinstance(reward_funcs[i], nn.Module):  # Use Module over PretrainedModel for compat w/ compiled models
-                self.reward_func_names.append(get_config_model_id(reward_funcs[i].config).split("/")[-1])
+                self.reward_func_names.append(reward_funcs[i].config._name_or_path.split("/")[-1])
             else:
                 self.reward_func_names.append(reward_funcs[i].__name__)
         self.reward_funcs = reward_funcs
@@ -353,7 +332,7 @@ class GRPOTrainer(BaseTrainer):
         for i, (reward_processing_class, reward_func) in enumerate(zip(reward_processing_classes, reward_funcs)):
             if isinstance(reward_func, PreTrainedModel):
                 if reward_processing_class is None:
-                    reward_processing_class = AutoTokenizer.from_pretrained(get_config_model_id(reward_func.config))
+                    reward_processing_class = AutoTokenizer.from_pretrained(reward_func.config._name_or_path)
                 if reward_processing_class.pad_token_id is None:
                     reward_processing_class.pad_token = reward_processing_class.eos_token
                 # The reward model computes the reward for the latest non-padded token in the input sequence.
@@ -363,22 +342,12 @@ class GRPOTrainer(BaseTrainer):
 
         self.reward_processing_classes = reward_processing_classes
 
-        # Rollout function
-        if rollout_func is not None and os.environ.get("TRL_EXPERIMENTAL_SILENCE", "0") != "1":
-            warnings.warn(
-                "You are importing from 'rollout_func', which is an experimental feature. This API may change or be "
-                "removed at any time without prior notice. Silence this warning by setting environment variable "
-                "TRL_EXPERIMENTAL_SILENCE=1.",
-                UserWarning,
-                stacklevel=2,
-            )
-        self.rollout_func = rollout_func
+        self.num_agents = args.num_agents
 
         # Training arguments
         self.max_prompt_length = args.max_prompt_length
         self.max_completion_length = args.max_completion_length  # = |o_i| in the GRPO paper
         self.num_generations = args.num_generations  # = G in the GRPO paper
-        self.chat_template_kwargs = args.chat_template_kwargs or {}
         self.temperature = args.temperature
         self.top_p = args.top_p
         self.top_k = args.top_k
@@ -391,17 +360,17 @@ class GRPOTrainer(BaseTrainer):
         self.vllm_tensor_parallel_size = args.vllm_tensor_parallel_size  # only applies to colocation mode
         self.vllm_importance_sampling_correction = args.vllm_importance_sampling_correction
         self.vllm_importance_sampling_cap = args.vllm_importance_sampling_cap
-        self.use_liger_kernel = args.use_liger_kernel
+        self.use_liger_loss = args.use_liger_loss
         self.loss_type = args.loss_type
         self.scale_rewards = args.scale_rewards
         self.importance_sampling_level = args.importance_sampling_level
         self.mask_truncated_completions = args.mask_truncated_completions
         self.top_entropy_quantile = args.top_entropy_quantile
-        if self.use_liger_kernel and self.top_entropy_quantile < 1.0:
+        if self.use_liger_loss and self.top_entropy_quantile < 1.0:
             raise NotImplementedError(
                 "Liger Kernels don't currently support masking token positions based on entropy."
             )
-        if self.use_liger_kernel and not self.importance_sampling_level == "token":
+        if self.use_liger_loss and not self.importance_sampling_level == "token":
             raise NotImplementedError(
                 "Liger Kernels currently only support token-level importance sampling. Please set"
                 "`importance_sampling_level` to 'token'."
@@ -426,8 +395,6 @@ class GRPOTrainer(BaseTrainer):
         self.num_iterations = args.num_iterations  # = 𝜇 in the GRPO paper
         self.epsilon_low = args.epsilon
         self.epsilon_high = args.epsilon_high if args.epsilon_high is not None else args.epsilon
-        # Max routing steps for orchestrator-agent workflow
-        self.max_routing_steps = getattr(args, 'max_routing_steps', 4)
         # Tracks the number of iterations (forward + backward passes), including those within a grad accum cycle
         self._step = 0
         # Buffer the batch to reuse generated outputs across multiple updates. For more details, see
@@ -480,29 +447,11 @@ class GRPOTrainer(BaseTrainer):
             if self.ref_model is not None:
                 disable_dropout_in_model(self.ref_model)
 
-        # Cast LM Head To FP32
-        if args.cast_lm_head_to_fp32:
-            if not model.config.tie_word_embeddings:
-
-                def cast_inputs_to_fp32(module, input):
-                    return (input[0].float(),)
-
-                model.lm_head = model.lm_head.float()
-                model.lm_head.register_forward_pre_hook(cast_inputs_to_fp32)
-                if self.ref_model is not None:
-                    self.ref_model.lm_head = self.ref_model.lm_head.float()
-                    self.ref_model.lm_head.register_forward_pre_hook(cast_inputs_to_fp32)
-            else:
-                raise NotImplementedError(
-                    "`cast_lm_head_to_fp32=True` is only supported when the model has untied word embedding and language modeling head layers"
-                    "i.e. `tie_word_embeddings` in the model config is False."
-                )
-
         # Liger loss
-        if self.use_liger_kernel:
+        if self.use_liger_loss:
             if not is_liger_kernel_available():
                 raise ImportError(
-                    "Liger is required to use `use_liger_kernel` as the GRPO loss. Run `pip install liger-kernel`."
+                    "Liger is required to use `liger_loss` as the GRPO loss. Run `pip install liger-kernel`."
                 )
             # redirect the model.module forward to the model forward to ensure pre-forward hooks are called
             self._forward_redirection = _ForwardRedirection()
@@ -599,10 +548,10 @@ class GRPOTrainer(BaseTrainer):
                     model_impl=self.args.vllm_model_impl,
                     enable_sleep_mode=self.args.vllm_enable_sleep_mode,
                     # Important so temperature scaling/logit tweaking affects the TIS log probs
-                    logprobs_mode="processed_logprobs",
+                    # logprobs_mode="processed_logprobs",
                 )
                 if self.args.vllm_enable_sleep_mode:
-                    self.llm.sleep(level=2)
+                    self.llm.sleep(level=1)
             else:
                 raise ValueError(f"vllm_mode must be either 'server' or 'colocate', got '{self.vllm_mode}'.")
 
@@ -897,6 +846,7 @@ class GRPOTrainer(BaseTrainer):
             # Divide logits by sampling temperature.
             # See https://huggingface.co/blog/the_n_implementation_details_of_rlhf_with_ppo#policy-training-implementation-details
             logits = logits / self.temperature
+
             completion_ids = input_ids_batch[:, -logits_to_keep:]
             logps = selective_log_softmax(logits, completion_ids)  # compute logprobs
             all_logps.append(logps)
@@ -1055,7 +1005,14 @@ class GRPOTrainer(BaseTrainer):
             generate_every = self.args.steps_per_generation * self.num_iterations
             if self._step % generate_every == 0 or self._buffered_inputs is None:
                 # self._buffered_inputs=None can occur when resuming from a checkpoint
+                print(f"[Rank {self.accelerator.process_index}] _prepare_inputs: About to call _generate_and_score_completions (step={self._step}, generate_every={generate_every})", flush=True)
+                # Ensure all processes are synchronized before generation
+                if torch.distributed.is_initialized():
+                    print(f"[Rank {self.accelerator.process_index}] _prepare_inputs: Waiting at barrier before generation", flush=True)
+                    torch.distributed.barrier()
+                    print(f"[Rank {self.accelerator.process_index}] _prepare_inputs: Passed barrier, calling _generate_and_score_completions", flush=True)
                 generation_batch = self._generate_and_score_completions(generation_batch)
+                print(f"[Rank {self.accelerator.process_index}] _prepare_inputs: Completed _generate_and_score_completions", flush=True)
                 generation_batch = split_pixel_values_by_grid(generation_batch)
                 generation_batch = shuffle_sequence_dict(generation_batch)
                 generation_batches = split_tensor_dict(generation_batch, self.args.steps_per_generation)
@@ -1069,9 +1026,20 @@ class GRPOTrainer(BaseTrainer):
         return inputs
 
     @profiling_decorator
-    def _calculate_rewards(self, inputs, prompts, completions, completion_ids_list):
+    def _calculate_rewards(self, inputs, prompts, completions, completion_ids_list, completion_types=None, last_agent_answers=None):
         device = self.accelerator.device
         rewards_per_func = torch.zeros(len(prompts), len(self.reward_funcs), device=device)
+        
+        # Debug: Check for length mismatches
+        if completion_types is not None:
+            len_completion_types = len(completion_types)
+            len_prompts = len(prompts)
+            len_completions = len(completions)
+            len_completion_ids = len(completion_ids_list)
+            if not (len_completion_types == len_prompts == len_completions == len_completion_ids):
+                print(f"[Rank {self.accelerator.process_index}] WARNING: Length mismatch in _calculate_rewards: "
+                      f"completion_types={len_completion_types}, prompts={len_prompts}, "
+                      f"completions={len_completions}, completion_ids_list={len_completion_ids}", flush=True)
 
         # Repeat all input columns (but "prompt", "completion", and "completion_ids") to match the num of generations
         keys = [key for key in inputs[0] if key not in ["prompt", "completion", "completion_ids"]]
@@ -1080,33 +1048,190 @@ class GRPOTrainer(BaseTrainer):
         # This allows for dynamic reward shaping based on training progress.
         reward_kwargs["trainer_state"] = self.state
 
+        # Check if this is multi-agent workflow and identify reward function types
+        is_multi_agent = completion_types is not None
+        if is_multi_agent:
+            # Find orchestrator_format_reward, think_answer_format_reward, and accuracy_reward indices
+            orchestrator_reward_idx = None
+            agent_reward_idx = None
+            accuracy_reward_idx = None
+            for i, reward_func_name in enumerate(self.reward_func_names):
+                if "orchestrator_format" in reward_func_name.lower() or reward_func_name == "orchestrator_format_reward":
+                    orchestrator_reward_idx = i
+                elif "think_answer_format" in reward_func_name.lower() or reward_func_name == "think_answer_format_reward":
+                    agent_reward_idx = i
+                elif "accuracy" in reward_func_name.lower() or reward_func_name in "accuracy_reward":
+                    accuracy_reward_idx = i
+
         for i, (reward_func, reward_processing_class, reward_func_name) in enumerate(
             zip(self.reward_funcs, self.reward_processing_classes, self.reward_func_names)
         ):
             with profiling_context(self, reward_func_name):
+                # For multi-agent workflow, apply reward functions selectively based on completion type
+                if is_multi_agent:
+                    if orchestrator_reward_idx is not None and i == orchestrator_reward_idx:
+                        # Only apply orchestrator_format_reward to orchestrator completions
+                        filtered_prompts = []
+                        filtered_completions = []
+                        filtered_completion_ids = []
+                        for j, comp_type in enumerate(completion_types):
+                            if comp_type == "orchestrator":
+                                # Add bounds check to prevent IndexError
+                                if j < len(prompts) and j < len(completions) and j < len(completion_ids_list):
+                                    filtered_prompts.append(prompts[j])
+                                    filtered_completions.append(completions[j])
+                                    filtered_completion_ids.append(completion_ids_list[j])
+                        if len(filtered_completions) == 0:
+                            # No orchestrator completions, set rewards to NaN
+                            rewards_per_func[:, i] = torch.nan
+                            continue
+                        use_prompts = filtered_prompts
+                        use_completions = filtered_completions
+                        use_completion_ids = filtered_completion_ids
+                    elif agent_reward_idx is not None and i == agent_reward_idx:
+                        # Only apply think_answer_format_reward to agent completions
+                        filtered_prompts = []
+                        filtered_completions = []
+                        filtered_completion_ids = []
+                        for j, comp_type in enumerate(completion_types):
+                            if comp_type == "agent":
+                                # Add bounds check to prevent IndexError
+                                if j < len(prompts) and j < len(completions) and j < len(completion_ids_list):
+                                    filtered_prompts.append(prompts[j])
+                                    filtered_completions.append(completions[j])
+                                    filtered_completion_ids.append(completion_ids_list[j])
+                        if len(filtered_completions) == 0:
+                            # No agent completions, set rewards to NaN
+                            rewards_per_func[:, i] = torch.nan
+                            continue
+                        use_prompts = filtered_prompts
+                        use_completions = filtered_completions
+                        use_completion_ids = filtered_completion_ids
+                    elif accuracy_reward_idx is not None and i == accuracy_reward_idx:
+                        # Apply accuracy_reward only to the last agent's answer
+                        if last_agent_answers is None or len(last_agent_answers) == 0:
+                            rewards_per_func[:, i] = torch.nan
+                            continue
+                        
+                        # Group completions by input: each input has 1 orchestrator + N agents
+                        # Find how many completions per input by counting orchestrators
+                        num_inputs = sum(1 for ct in completion_types if ct == "orchestrator")
+                        
+                        # Create completions from last agent answers (one per input)
+                        accuracy_completions = []
+                        for input_idx in range(num_inputs):
+                            if input_idx < len(last_agent_answers):
+                                answer = last_agent_answers[input_idx]
+                                accuracy_completions.append([{"role": "assistant", "content": answer}])
+                            else:
+                                accuracy_completions.append([{"role": "assistant", "content": ""}])
+                        
+                        # Prepare solution for accuracy reward (one per input)
+                        if "solution" in reward_kwargs:
+                            solutions = reward_kwargs["solution"]
+                            # Solutions are repeated for num_generations, so take unique ones
+                            unique_solutions = solutions[::self.num_generations] if len(solutions) >= self.num_generations * num_inputs else solutions
+                            accuracy_reward_kwargs = {**reward_kwargs, "solution": unique_solutions[:num_inputs]}
+                        else:
+                            accuracy_reward_kwargs = reward_kwargs
+                        
+                        # Calculate accuracy reward for each input's last agent answer
+                        output_reward_func = reward_func(
+                            prompts=[], completions=accuracy_completions, completion_ids=[], **accuracy_reward_kwargs
+                        )
+                        output_reward_func = [reward if reward is not None else torch.nan for reward in output_reward_func]
+                        computed_rewards = torch.tensor(output_reward_func, dtype=torch.float32, device=device)
+                        
+                        # Map rewards back to all completions: if last agent's answer is correct,
+                        # all completions (orchestrator + all agents) for that input get the same reward
+                        input_idx = -1  # Start at -1, will be 0 after first orchestrator
+                        for j, comp_type in enumerate(completion_types):
+                            # Add bounds check to prevent IndexError
+                            if j >= len(prompts):
+                                continue
+                            if comp_type == "orchestrator":
+                                # Orchestrator completion: assign the same reward as the last agent for this input
+                                input_idx += 1
+                                if input_idx < len(computed_rewards):
+                                    rewards_per_func[j, i] = computed_rewards[input_idx]
+                                else:
+                                    rewards_per_func[j, i] = torch.nan
+                            elif comp_type == "agent":
+                                # All agent completions for the same input get the same reward
+                                # The current input_idx is the same as the last orchestrator we saw
+                                if input_idx >= 0 and input_idx < len(computed_rewards):
+                                    rewards_per_func[j, i] = computed_rewards[input_idx]
+                                else:
+                                    rewards_per_func[j, i] = torch.nan
+                        continue
+                    else:
+                        # For other reward functions, apply to all completions
+                        use_prompts = prompts
+                        use_completions = completions
+                        use_completion_ids = completion_ids_list
+                else:
+                    # Standard workflow: apply to all completions
+                    use_prompts = prompts
+                    use_completions = completions
+                    use_completion_ids = completion_ids_list
+
                 if isinstance(reward_func, nn.Module):  # Module (no PretrainedModel) for compat with compiled models
                     if is_conversational(inputs[0]):
-                        messages = [{"messages": p + c} for p, c in zip(prompts, completions)]
-                        texts = [
-                            apply_chat_template(x, reward_processing_class, **self.chat_template_kwargs)["text"]
-                            for x in messages
-                        ]
+                        messages = [{"messages": p + c} for p, c in zip(use_prompts, use_completions)]
+                        texts = [apply_chat_template(x, reward_processing_class)["text"] for x in messages]
                     else:
-                        texts = [p + c for p, c in zip(prompts, completions)]
+                        texts = [p + c for p, c in zip(use_prompts, use_completions)]
                     reward_inputs = reward_processing_class(
                         text=texts, return_tensors="pt", padding=True, padding_side="right", add_special_tokens=False
                     )
                     reward_inputs = super()._prepare_inputs(reward_inputs)
                     with torch.inference_mode():
-                        rewards_per_func[:, i] = reward_func(**reward_inputs).logits[:, 0]  # Shape (B*G,)
+                        computed_rewards = reward_func(**reward_inputs).logits[:, 0]  # Shape (N,)
+                        
+                    # Map computed rewards back to original positions
+                    if is_multi_agent and (i == orchestrator_reward_idx or i == agent_reward_idx):
+                        reward_idx = 0
+                        for j, comp_type in enumerate(completion_types):
+                            # Add bounds check to prevent IndexError
+                            if j >= len(prompts):
+                                continue
+                            if (i == orchestrator_reward_idx and comp_type == "orchestrator") or \
+                               (i == agent_reward_idx and comp_type == "agent"):
+                                if reward_idx < len(computed_rewards):
+                                    rewards_per_func[j, i] = computed_rewards[reward_idx]
+                                    reward_idx += 1
+                                else:
+                                    rewards_per_func[j, i] = torch.nan
+                            else:
+                                rewards_per_func[j, i] = torch.nan
+                    else:
+                        rewards_per_func[:, i] = computed_rewards
                 else:
                     output_reward_func = reward_func(
-                        prompts=prompts, completions=completions, completion_ids=completion_ids_list, **reward_kwargs
+                        prompts=use_prompts, completions=use_completions, completion_ids=use_completion_ids, **reward_kwargs
                     )
                     # Convert None values to NaN
                     output_reward_func = [reward if reward is not None else torch.nan for reward in output_reward_func]
-
-                    rewards_per_func[:, i] = torch.tensor(output_reward_func, dtype=torch.float32, device=device)
+                    computed_rewards = torch.tensor(output_reward_func, dtype=torch.float32, device=device)
+                    
+                    # Map computed rewards back to original positions
+                    if is_multi_agent and (i == orchestrator_reward_idx or i == agent_reward_idx):
+                        reward_idx = 0
+                        for j, comp_type in enumerate(completion_types):
+                            # Add bounds check to prevent IndexError
+                            if j >= len(prompts):
+                                continue
+                            if (i == orchestrator_reward_idx and comp_type == "orchestrator") or \
+                               (i == agent_reward_idx and comp_type == "agent"):
+                                if reward_idx < len(computed_rewards):
+                                    rewards_per_func[j, i] = computed_rewards[reward_idx]
+                                    reward_idx += 1
+                                else:
+                                    rewards_per_func[j, i] = torch.nan
+                            else:
+                                rewards_per_func[j, i] = torch.nan
+                    else:
+                        rewards_per_func[:, i] = computed_rewards
 
         # If all reward functions return None for a given row, issue a detailed warning
         if torch.isnan(rewards_per_func).all(dim=1).any():
@@ -1126,84 +1251,96 @@ class GRPOTrainer(BaseTrainer):
         rewards_per_func = gather(rewards_per_func)
         return rewards_per_func
 
-    def _generate_single_turn(self, prompts: list):
+    def _generate_single_turn(self, prompts: Union[List[str], List[List[dict]]], images: Optional[list], num_generations: Optional[int] = None):
         device = self.accelerator.device
+        # If num_generations is not specified, use self.num_generations (for orchestrator)
+        # If specified (e.g., 1 for agents), use that value
+        n_generations = num_generations if num_generations is not None else self.num_generations
+
+        # If the prompts are conversational and the inputs contain images, we need to convert the prompts from
+        # [{"role": "user", "content": "What color is the sky?"}] to
+        # [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": "What color is the sky?"}]}]
+        kwargs = {}
+        if images is not None:
+            kwargs = {"images": images}
+            for prompt, image_list in zip(prompts, images):
+                if isinstance(prompt, list):  # i.e., when using conversational data
+                    prepare_multimodal_messages(prompt, num_images=len(image_list))
+
+        prompts_text = [
+            maybe_apply_chat_template({"prompt": prompt}, self.processing_class)["prompt"] for prompt in prompts
+        ]
+
+        if images is not None:
+            prompt_inputs = self.processing_class(text=prompts_text, padding=True, return_tensors="pt", **kwargs)
+            prompt_inputs = super()._prepare_inputs(prompt_inputs)
+            forward_kwargs = {k: v for k, v in prompt_inputs.items() if k not in ["input_ids", "attention_mask"]}
+        else:
+            forward_kwargs = {}
 
         # Generate completions using either vLLM or regular generation
         if self.use_vllm:
+            print(f"[Rank {self.accelerator.process_index}] Using vLLM, mode={self.vllm_mode}, num_generations={n_generations}", flush=True)
             if self.vllm_mode == "colocate" and self.args.vllm_enable_sleep_mode:
                 # wake up colocated vLLM instances if needed
                 torch.cuda.empty_cache()  # required to avoid OOM in some cases
-                self.llm.wake_up(tags=["weights"])
+                print(f"[Rank {self.accelerator.process_index}] Waking up vLLM", flush=True)
+                self.llm.wake_up()
+                print(f"[Rank {self.accelerator.process_index}] vLLM woken up", flush=True)
 
             # First, update the vLLM weights if needed
             if self.state.global_step != self._last_loaded_step:
+                print(f"[Rank {self.accelerator.process_index}] Moving model to vLLM", flush=True)
                 self._move_model_to_vllm()
                 self._last_loaded_step = self.state.global_step
-
-            if is_conversational({"prompt": prompts[0]}):
-                prompts = [prepare_multimodal_messages_vllm(prompt) for prompt in prompts]
+                print(f"[Rank {self.accelerator.process_index}] Model moved to vLLM", flush=True)
 
             # Generate completions using vLLM: gather all prompts and use them in a single call in the main process
             if self.vllm_mode == "server":
-                all_prompts = gather_object(prompts)
+                print(f"[Rank {self.accelerator.process_index}] Using vLLM server mode", flush=True)
+                print(f"[Rank {self.accelerator.process_index}] Gathering prompts (len={len(prompts_text)})", flush=True)
+                all_prompts_text = gather_object(prompts_text)
+                print(f"[Rank {self.accelerator.process_index}] Gathered prompts (len={len(all_prompts_text) if all_prompts_text else 0})", flush=True)
+                if images is not None:
+                    all_images = gather_object(images)
 
                 if self.accelerator.is_main_process:
-                    # Since 'prompts' contains 'num_generations' duplicates, we first take unique prompts, and generate
-                    # num_generations outputs for each one. This is faster than generating outputs for each duplicate
+                    # Since 'prompts' may contain 'num_generations' duplicates, we first take unique prompts, and generate
+                    # n_generations outputs for each one. This is faster than generating outputs for each duplicate
                     # prompt individually.
-                    ordered_set_of_prompts = all_prompts[:: self.num_generations]
+                    ordered_set_of_prompts = all_prompts_text[:: n_generations] if n_generations > 1 else all_prompts_text
 
-                    sampling_params = {
-                        "n": self.num_generations,
-                        "repetition_penalty": self.repetition_penalty,
-                        "temperature": self.temperature,
-                        "top_p": self.top_p,
-                        "top_k": -1 if self.top_k is None else self.top_k,
-                        "min_p": 0.0 if self.min_p is None else self.min_p,
-                        "max_tokens": self.max_completion_length,
-                        "truncate_prompt_tokens": self.max_prompt_length,
-                        "guided_decoding_regex": self.guided_decoding_regex,
-                        "generation_kwargs": self.args.generation_kwargs,
-                    }
+                    if images is not None:
+                        ordered_set_of_images = all_images[:: n_generations] if n_generations > 1 else all_images
+                    else:
+                        ordered_set_of_images = None
+
                     with profiling_context(self, "vLLM.generate"):
-                        if self.rollout_func is not None:
-                            if is_conversational({"prompt": ordered_set_of_prompts[0]}):
-                                ordered_set_of_prompts = [
-                                    apply_chat_template(
-                                        {"prompt": p}, self.processing_class, **self.chat_template_kwargs
-                                    )["prompt"]
-                                    for p in ordered_set_of_prompts
-                                ]
-                            output = self.rollout_func(
-                                ordered_set_of_prompts,
-                                self.args,
-                                self.processing_class,
-                            )
-                        else:
-                            if is_conversational({"prompt": ordered_set_of_prompts[0]}):
-                                # FIXME: this endpoint doesn't exist in vllm_client
-                                output = self.vllm_client.chat(
-                                    prompts=ordered_set_of_prompts,
-                                    **sampling_params,
-                                    chat_template_kwargs=self.chat_template_kwargs,
-                                )
-                            else:
-                                output = self.vllm_client.generate(prompts=ordered_set_of_prompts, **sampling_params)
-                        # Extract required fields and collect any extra fields for reward functions
-                        required_keys = {"prompt_ids", "completion_ids", "logprobs"}
-                        extra_fields = {k: v for k, v in output.items() if k not in required_keys}
-                        payload = (output["prompt_ids"], output["completion_ids"], output["logprobs"], extra_fields)
+                        output = self.vllm_client.generate(
+                            prompts=ordered_set_of_prompts,
+                            images=ordered_set_of_images,
+                            n=n_generations,
+                            repetition_penalty=self.repetition_penalty,
+                            temperature=self.temperature,
+                            top_p=self.top_p,
+                            top_k=-1 if self.top_k is None else self.top_k,
+                            min_p=0.0 if self.min_p is None else self.min_p,
+                            max_tokens=self.max_completion_length,
+                            truncate_prompt_tokens=self.max_prompt_length,
+                            guided_decoding_regex=self.guided_decoding_regex,
+                            generation_kwargs=self.args.generation_kwargs,
+                        )
+                        payload = (output["prompt_ids"], output["completion_ids"], output["logprobs"])
                 else:
                     payload = None
 
                 # Broadcast the completions from the main process to all processes, ensuring each process receives its corresponding slice.
                 obj_list = [payload]
                 broadcast_object_list(obj_list, from_process=0)
-                all_prompt_ids, all_completion_ids, all_logprobs, all_extra_fields = obj_list[0]
+                all_prompt_ids, all_completion_ids, all_logprobs = obj_list[0]
 
-                # At this point, we only get 1 copy of each prompt, so we need to repeat them num_generations times
-                all_prompt_ids = [ids for ids in all_prompt_ids for _ in range(self.num_generations)]
+                # At this point, we only get 1 copy of each prompt, so we need to repeat them n_generations times
+                all_prompt_ids = [ids for ids in all_prompt_ids for _ in range(n_generations)]
 
                 process_slice = slice(
                     self.accelerator.process_index * len(prompts),
@@ -1213,23 +1350,16 @@ class GRPOTrainer(BaseTrainer):
                 completion_ids = all_completion_ids[process_slice]
                 logprobs = all_logprobs[process_slice]
 
-                # Slice extra fields dict-of-lists per process (extra fields are per-completion, like completion_ids)
-                extra_fields = {}
-                for key, values in all_extra_fields.items():
-                    if isinstance(values, list):
-                        extra_fields[key] = values[process_slice]
-                    else:
-                        extra_fields[key] = values
-
             # Generate completions using colocated vLLM instances: each device holds vLLM copy and work on their own batch of prompts
             elif self.vllm_mode == "colocate":
+                print(f"[Rank {self.accelerator.process_index}] Using vLLM colocate mode, TP size={self.vllm_tensor_parallel_size}", flush=True)
                 if self.guided_decoding_regex:
                     guided_decoding = GuidedDecodingParams(regex=self.guided_decoding_regex)
                 else:
                     guided_decoding = None
 
                 generation_kwargs = {
-                    "n": 1,  # vLLM on each GPU generates only 1 in colocate mode
+                    "n": n_generations,  # Use n_generations parameter (1 for agents, num_generations for orchestrator)
                     "repetition_penalty": self.repetition_penalty,
                     "temperature": self.temperature,
                     "top_p": self.top_p,
@@ -1247,21 +1377,33 @@ class GRPOTrainer(BaseTrainer):
                 if self.vllm_tensor_parallel_size > 1:
                     # Gather prompts from all ranks in the TP group and flatten.
                     # Each rank starts with its own prompts; after gathering, all ranks see the full group set.
-                    orig_size = len(prompts)
+                    orig_size = len(prompts_text)
+                    print(f"[Rank {self.accelerator.process_index}] Gathering prompts in TP group (orig_size={orig_size})", flush=True)
                     gathered_prompts = [None for _ in range(self.vllm_tensor_parallel_size)]
-                    torch.distributed.all_gather_object(gathered_prompts, prompts, group=self.tp_group)
-                    all_prompts = [p for sublist in gathered_prompts for p in sublist]
-                else:
-                    all_prompts = prompts
+                    torch.distributed.all_gather_object(gathered_prompts, prompts_text, group=self.tp_group)
+                    print(f"[Rank {self.accelerator.process_index}] Gathered prompts in TP group", flush=True)
+                    all_prompts_text = [p for sublist in gathered_prompts for p in sublist]
 
-                if self.args.vllm_enable_sleep_mode:
-                    self.llm.wake_up(tags=["kv_cache"])
+                    if images is not None:
+                        gathered_images = [None for _ in range(self.vllm_tensor_parallel_size)]
+                        torch.distributed.all_gather_object(gathered_images, images, group=self.tp_group)
+                        all_images = [img for sublist in gathered_images for img in sublist]
+                    else:
+                        all_images = None
+                else:
+                    all_prompts_text = prompts_text
+                    all_images = images
+
+                if images is not None and all_images:
+                    vllm_inputs = []
+                    for prompt, image_list in zip(all_prompts_text, all_images):
+                        vllm_inputs.append({"prompt": prompt, "multi_modal_data": {"image": image_list}})
+
+                else:
+                    vllm_inputs = all_prompts_text
 
                 with profiling_context(self, "vLLM.generate"):
-                    if is_conversational({"prompt": prompts[0]}):
-                        all_outputs = self.llm.chat(all_prompts, sampling_params=sampling_params, use_tqdm=False)
-                    else:
-                        all_outputs = self.llm.generate(all_prompts, sampling_params=sampling_params, use_tqdm=False)
+                    all_outputs = self.llm.generate(vllm_inputs, sampling_params=sampling_params, use_tqdm=False)
 
                 all_prompt_ids = [output.prompt_token_ids for output in all_outputs]
                 all_completion_ids = [output.token_ids for outputs in all_outputs for output in outputs.outputs]
@@ -1284,29 +1426,19 @@ class GRPOTrainer(BaseTrainer):
                     completion_ids = all_completion_ids
                     logprobs = all_logprobs
 
-                extra_fields = {}  # No extra fields for colocate mode
-
                 if self.args.vllm_enable_sleep_mode:
-                    self.llm.sleep(level=2)
+                    self.llm.sleep(level=1)
 
         elif self.use_transformers_paged:
-            processor_kwargs = {
-                "max_length": self.max_prompt_length,
-                "truncation": True,
-                "add_special_tokens": False,
-            }
-            if is_conversational({"prompt": prompts[0]}):
-                processor_outputs = self.processing_class.apply_chat_template(
-                    conversation=prompts,
-                    **processor_kwargs,
-                    add_generation_prompt=True,
-                    tokenize=True,
-                    return_dict=True,
-                    **self.chat_template_kwargs,
-                )
-            else:
-                processor_outputs = self.processing_class(text=prompts, **processor_kwargs)
+            # Re-process inputs for paged generation if needed
+            # Note: images are already validated and preprocessed above
+            paged_prompt_inputs = self.processing_class(text=prompts_text, **kwargs)
+            previous_attn = self.model_wrapped.config._attn_implementation
 
+            if is_flash_attn_2_available():
+                self.model_wrapped.config._attn_implementation = "paged_attention"
+            else:
+                self.model_wrapped.config._attn_implementation = "sdpa_paged"
             with (
                 profiling_context(self, "transformers.generate_batch"),
                 unwrap_model_for_generation(
@@ -1320,40 +1452,29 @@ class GRPOTrainer(BaseTrainer):
                     unwrapped_model.to(torch.bfloat16)
                 elif self.args.fp16:
                     unwrapped_model.to(torch.float16)
-                if self.args.cast_lm_head_to_fp32:
-                    unwrapped_model.lm_head.to(torch.float32)
                 with torch.inference_mode():
-                    # Continuous batching API expects 'inputs' arg only
                     all_outputs = unwrapped_model.generate_batch(
-                        processor_outputs["input_ids"], generation_config=self.generation_config, progress_bar=False
+                        paged_prompt_inputs.input_ids, generation_config=self.generation_config, progress_bar=False
                     )
                     unwrapped_model.train()  # restore training mode, as generate_batch forces eval mode
             completion_ids = [output.generated_tokens for output in all_outputs.values()]
-            prompt_ids = processor_outputs["input_ids"]
+            prompt_ids = paged_prompt_inputs.input_ids
+            # Restore the original attention implementation, training mode
+            self.model_wrapped.config._attn_implementation = previous_attn
             logprobs = None  # not used in this case
-            extra_fields = {}  # No extra fields for paged mode
 
         else:
             # Regular generation path
-            processor_kwargs = {
-                "return_tensors": "pt",
-                "padding": True,
-                "padding_side": "left",
-                "max_length": self.max_prompt_length,
-                "truncation": True,
-                "add_special_tokens": False,
-            }
-            if is_conversational({"prompt": prompts[0]}):
-                generate_inputs = self.processing_class.apply_chat_template(
-                    conversation=prompts,
-                    **processor_kwargs,
-                    add_generation_prompt=True,
-                    tokenize=True,
-                    return_dict=True,
-                    **self.chat_template_kwargs,
-                )
-            else:
-                generate_inputs = self.processing_class(text=prompts, **processor_kwargs)
+            generate_inputs = self.processing_class(
+                text=prompts_text,
+                return_tensors="pt",
+                padding=True,
+                padding_side="left",
+                max_length=self.max_prompt_length,
+                truncation=True,
+                add_special_tokens=False,
+                **kwargs,
+            )
             generate_inputs = super()._prepare_inputs(generate_inputs)
 
             with (
@@ -1381,78 +1502,267 @@ class GRPOTrainer(BaseTrainer):
             prompt_ids = [p[m].tolist() for p, m in zip(prompt_ids, prompt_mask.bool())]
             completion_ids = [c[m].tolist() for c, m in zip(completion_ids, completion_mask.bool())]
             logprobs = None  # not used in this case
-            extra_fields = {}  # No extra fields for non-rollout_func paths
 
-        return prompt_ids, completion_ids, logprobs, extra_fields
+        return prompt_ids, completion_ids, logprobs, forward_kwargs
 
-    def _parse_orchestrator_output(self, completion: str) -> tuple[list[str], list[str], bool]:
-        """Parse orchestrator output to extract subtasks and role_instructions."""
-        subtasks = []
-        role_instructions = []
-        is_valid_format = False
+    def _generate_multi_agent_completions(
+        self, inputs: list[dict[str, Union[torch.Tensor, Any]]], prompts: list
+    ):
+        """
+        Generate completions for multi-agent workflow:
+        1. Generate orchestrator completion
+        2. Parse orchestrator output to get subtasks and role_instructions
+        3. Generate completions for each agent sequentially
+        4. Return the last agent's completion for training
+        """
+        device = self.accelerator.device
+        mode = "train" if self.model.training else "eval"
         
-        SUBTASKS_LIST_RE = re.compile(r"subtasks\s*=\s*\[(.*?)\]", re.DOTALL | re.IGNORECASE)
-        ROLE_INSTRUCTIONS_LIST_RE = re.compile(r"role_instructions\s*=\s*\[(.*?)\]", re.DOTALL | re.IGNORECASE)
+        # Step 1: Generate orchestrator completion
+        import time
+        orchestrator_start_time = time.time()
+        logging.get_logger(__name__).info(f"[Rank {self.accelerator.process_index}] Generating orchestrator completions for {len(prompts)} inputs")
         
-        subtasks_match = SUBTASKS_LIST_RE.search(completion)
-        role_instructions_match = ROLE_INSTRUCTIONS_LIST_RE.search(completion)
+        orchestrator_prompts = prompts
+        (
+            orchestrator_prompt_ids_list,
+            orchestrator_completion_ids_list,
+            orchestrator_logprobs_list,
+            forward_kwargs,
+        ) = self._generate_single_turn(orchestrator_prompts, images=None, num_generations=self.num_generations)
         
-        if subtasks_match and role_instructions_match:
-            subtasks_str = subtasks_match.group(1)
-            subtask_matches = re.findall(r'"(.*?)"', subtasks_str, re.DOTALL)
-            subtasks = [m.replace('\\n', '\n').replace('\\"', '"').strip() for m in subtask_matches]
+        orchestrator_elapsed = time.time() - orchestrator_start_time
+        logging.get_logger(__name__).info(f"[Rank {self.accelerator.process_index}] Orchestrator completions completed in {orchestrator_elapsed:.2f}s")
+        
+        # Decode orchestrator completions
+        orchestrator_completions_text = self.processing_class.batch_decode(
+            [torch.tensor(ids, device=device) for ids in orchestrator_completion_ids_list],
+            skip_special_tokens=True
+        )
+        
+        # Log orchestrator completions
+        for idx, completion in enumerate(orchestrator_completions_text):
+            completion_preview = completion[:500] + "..." if len(completion) > 500 else completion
+            logging.get_logger(__name__).info(f"[Rank {self.accelerator.process_index}] Orchestrator completion {idx+1}:\n{completion_preview}")
+        
+        # Store all completions (orchestrator + all agents) for loss calculation
+        all_prompt_ids_list = []
+        all_completion_ids_list = []
+        all_logprobs_list = []
+        completion_types = []  # Track completion types: "orchestrator" or "agent"
+        last_agent_answers = []  # Store the final answer from the last agent for each input
+        total_completion_tokens = 0
+        for i, (orchestrator_completion, input_item) in enumerate(zip(orchestrator_completions_text, inputs)):
+            input_start_time = time.time()
+            logging.get_logger(__name__).info(f"[Rank {self.accelerator.process_index}] Processing input {i+1}/{len(inputs)}")
             
-            role_instructions_str = role_instructions_match.group(1)
-            role_matches = re.findall(r'"(.*?)"', role_instructions_str, re.DOTALL)
-            role_instructions = [m.replace('\\n', '\n').replace('\\"', '"').strip() for m in role_matches]
+            # Log orchestrator completion for this input
+            orchestrator_preview = orchestrator_completion[:500] + "..." if len(orchestrator_completion) > 500 else orchestrator_completion
+            logging.get_logger(__name__).info(f"[Rank {self.accelerator.process_index}] Input {i+1} - Orchestrator completion:\n{orchestrator_preview}")
             
-            if subtasks and role_instructions and len(subtasks) == len(role_instructions):
-                if len(subtasks) <= self.max_routing_steps:
-                    is_valid_format = True
+            # Parse orchestrator output
+            parsed = parse_orchestrator_output(orchestrator_completion)
+            
+            if parsed is None:
+                subtasks, role_instructions = [], []
+            else:
+                subtasks, role_instructions = parsed
+            original_question = input_item.get("original_question", "")
+            
+            # Add orchestrator completion to the list
+            all_prompt_ids_list.append(orchestrator_prompt_ids_list[i])
+            all_completion_ids_list.append(orchestrator_completion_ids_list[i])
+            completion_types.append("orchestrator")  # Mark as orchestrator completion
+            all_logprobs_list.append(orchestrator_logprobs_list[i])
+            total_completion_tokens += len(orchestrator_completion_ids_list[i])
+            
+            # Step 3: Generate completions for each agent sequentially
+            agent_outputs = []
+            
+            if len(subtasks) > 0:
+                logging.get_logger(__name__).info(f"[Rank {self.accelerator.process_index}] Input {i+1}: Generating {len(subtasks)} agent completions")
+            
+                for agent_idx, (subtask, role_instruction) in enumerate(zip(subtasks, role_instructions)):
+                    agent_start_time = time.time()
+                    logging.get_logger(__name__).info(f"[Rank {self.accelerator.process_index}] Input {i+1}, Agent {agent_idx+1}/{len(subtasks)}: Starting generation")
+                    
+                    # Create agent prompt
+                    previous_outputs = agent_outputs if agent_outputs else None
+                    agent_prompt_text = self._make_agent_prompt(original_question, subtask, role_instruction, previous_outputs)
+                    
+                    # Convert to conversational format
+                    agent_prompt = [
+                        {"role": "system", "content": "You are a helpful assistant that solves complex problems."},
+                        {"role": "user", "content": agent_prompt_text}
+                    ]
+                    
+                    # Generate agent completion (only 1 per orchestrator completion, not num_generations)
+                    agent_prompts_list = [agent_prompt]
+                    (
+                        agent_prompt_ids_list,
+                        agent_completion_ids_list,
+                        agent_logprobs_list,
+                        agent_forward_kwargs,
+                    ) = self._generate_single_turn(agent_prompts_list, images=None, num_generations=1)
+                    
+                    agent_elapsed = time.time() - agent_start_time
+                    
+                    # Decode agent completion
+                    agent_completion_text = self.processing_class.batch_decode(
+                        [torch.tensor(ids, device=device) for ids in agent_completion_ids_list],
+                        skip_special_tokens=True
+                    )[0]
+                    
+                    # Log agent completion
+                    agent_completion_preview = agent_completion_text[:500] + "..." if len(agent_completion_text) > 500 else agent_completion_text
+                    logging.get_logger(__name__).info(f"[Rank {self.accelerator.process_index}] Input {i+1}, Agent {agent_idx+1}/{len(subtasks)}: Completed in {agent_elapsed:.2f}s")
+                    logging.get_logger(__name__).info(f"[Rank {self.accelerator.process_index}] Input {i+1}, Agent {agent_idx+1}/{len(subtasks)} - Completion:\n{agent_completion_preview}")
+
+                    # Extract only the answer between <answer> and </answer>
+                    import re
+                    match = re.search(r"<answer>(.*?)</answer>", agent_completion_text, re.DOTALL | re.IGNORECASE)
+                    if match:
+                        agent_answer = match.group(1).strip()
+                    else:
+                        agent_answer = agent_completion_text.strip()
+                    
+                    # Log extracted answer
+                    agent_answer_preview = agent_answer[:300] + "..." if len(agent_answer) > 300 else agent_answer
+                    logging.get_logger(__name__).info(f"[Rank {self.accelerator.process_index}] Input {i+1}, Agent {agent_idx+1}/{len(subtasks)} - Extracted answer:\n{agent_answer_preview}")
+
+                    agent_outputs.append(agent_answer)
+                    
+                    # Add agent completion to the list (for loss calculation)
+                    all_prompt_ids_list.append(agent_prompt_ids_list[0])
+                    all_completion_ids_list.append(agent_completion_ids_list[0])
+                    completion_types.append("agent")  # Mark as agent completion
+                    all_logprobs_list.append(agent_logprobs_list[0])
+                    total_completion_tokens += len(agent_completion_ids_list[0])
+                    
+                    # Store the last agent's answer for accuracy reward
+                    if agent_idx == len(subtasks) - 1:  # Last agent
+                        if i < len(last_agent_answers):
+                            last_agent_answers[i] = agent_answer
+                        else:
+                            last_agent_answers.append(agent_answer)
+                    
+            else:
+                agent_prompt_text = self._make_agent_prompt(original_question, subtask=None, role_instruction=None, previous_outputs=None)
+                    
+                # Convert to conversational format
+                agent_prompt = [
+                    {"role": "system", "content": "You are a helpful assistant that solves complex problems."},
+                    {"role": "user", "content": agent_prompt_text}
+                ]
+                
+                # Generate agent completion (only 1 per orchestrator completion, not num_generations)
+                agent_prompts_list = [agent_prompt]
+                (
+                    agent_prompt_ids_list,
+                    agent_completion_ids_list,
+                    agent_logprobs_list,
+                    agent_forward_kwargs,
+                ) = self._generate_single_turn(agent_prompts_list, None, num_generations=1)
+                
+                # Decode agent completion
+                agent_completion_text = self.processing_class.batch_decode(
+                    [torch.tensor(ids, device=device) for ids in agent_completion_ids_list],
+                    skip_special_tokens=True
+                )[0]
+                
+                # Log agent completion (no subtasks case)
+                agent_completion_preview = agent_completion_text[:500] + "..." if len(agent_completion_text) > 500 else agent_completion_text
+                logging.get_logger(__name__).info(f"[Rank {self.accelerator.process_index}] Input {i+1}, Agent (no subtasks) - Completion:\n{agent_completion_preview}")
+
+                # Extract only the answer between <answer> and </answer>
+                import re
+                match = re.search(r"<answer>(.*?)</answer>", agent_completion_text, re.DOTALL | re.IGNORECASE)
+                if match:
+                    agent_answer = match.group(1).strip()
+                else:
+                    agent_answer = agent_completion_text.strip()
+                
+                # Log extracted answer
+                agent_answer_preview = agent_answer[:300] + "..." if len(agent_answer) > 300 else agent_answer
+                logging.get_logger(__name__).info(f"[Rank {self.accelerator.process_index}] Input {i+1}, Agent (no subtasks) - Extracted answer:\n{agent_answer_preview}")
+
+                agent_outputs.append(agent_answer)
+                
+                # Add agent completion to the list (for loss calculation)
+                all_prompt_ids_list.append(agent_prompt_ids_list[0])
+                all_completion_ids_list.append(agent_completion_ids_list[0])
+                completion_types.append("agent")  # Mark as agent completion
+                all_logprobs_list.append(agent_logprobs_list[0])
+                total_completion_tokens += len(agent_completion_ids_list[0])
+                
+                # Store the last agent's answer for accuracy reward (when no subtasks)
+                if i < len(last_agent_answers):
+                    last_agent_answers[i] = agent_answer
+                else:
+                    last_agent_answers.append(agent_answer)
+            
+            input_elapsed = time.time() - input_start_time
+            logging.get_logger(__name__).info(f"[Rank {self.accelerator.process_index}] Input {i+1}/{len(inputs)}: Completed in {input_elapsed:.2f}s")
         
-        return subtasks, role_instructions, is_valid_format
+        # Calculate total completion tokens
+        num_items_in_batch = torch.tensor(total_completion_tokens, device=device)
+        
+        return (
+            all_prompt_ids_list,
+            all_completion_ids_list,
+            num_items_in_batch,
+            all_logprobs_list,
+            forward_kwargs,
+            completion_types,  # Return completion types for reward calculation
+            last_agent_answers,  # Return last agent answers for accuracy reward
+        )
     
-    def _prepare_agent_messages(self, subtask: str, role_instruction: str, base_question: str, history: list = None) -> list:
-        """Prepare messages for agent generation."""
-        if history is None:
-            history = []
+    def _make_agent_prompt(self, original_question: str, subtask: str, role_instruction: str, previous_outputs: Optional[List[str]] = None) -> str:
+        """Create a prompt for an agent given its subtask, role, and previous outputs."""
         
-        user_content = f"Task: {base_question}\n\n"
-        if role_instruction:
-            user_content += f"Your Role: {role_instruction}\n\n"
-        user_content += f"Your Subtask: {subtask}\n\n"
-        
-        if history:
-            user_content += "\nPrevious agent responses:\n"
-            for i, h in enumerate(history):
-                ANSWER_RE = re.compile(r"<start_answer>(.*?)<end_answer>", re.DOTALL | re.IGNORECASE)
-                prev_answer_match = ANSWER_RE.search(h)
-                if prev_answer_match:
-                    prev_answer = prev_answer_match.group(1).strip()
-                    user_content += f"Agent {i+1} answer: {prev_answer}\n\n"
-        
-        user_content += """Please solve your subtask following this format:
-1. Put your reasoning process between <start_think> and <end_think> tags.
-2. Put your final answer/solution between <start_answer> and <end_answer> tags.
+        default_agent_prompt = """You first think about the reasoning process in the mind and then provide the answer.
+
+The reasoning process is enclosed within <think> and </think> tags and the final answer is enclosed within <answer> and </answer> tags.
 
 Example format:
-<start_think>
+<think>
 [Your reasoning and thought process here]
-<end_think>
-<start_answer>
-[Your final solution here]
-<end_answer>"""
-        
-        return [
-            {"role": "user", "content": user_content},
-            {"role": "assistant", "content": "I'll solve this step by step."}
-        ]
+</think>
+<answer>
+[Your final answer here]
+</answer>
+"""   
 
-    def _generate(self, prompts: list):
+        if subtask is None:
+            
+            no_subtask_prompt = "\n\n Now solve the following problem:\n\n{original_question}"
+            
+            agent_prompt = default_agent_prompt+no_subtask_prompt
+            
+            return agent_prompt
+        
+        with_subtask_prompt = f"Problem: {original_question}\n\n"
+        
+        if previous_outputs:
+            with_subtask_prompt += "Previous Agent Outputs:\n"
+            for i, prev_output in enumerate(previous_outputs, 1):
+                with_subtask_prompt += f"\nAgent {i} Output:\n{prev_output}\n"
+            with_subtask_prompt += "\n"
+        
+        with_subtask_prompt += f"Your Task: {subtask}\n\n"
+        with_subtask_prompt += f"Your Role Instruction: {role_instruction}\n\n"
+        
+        with_subtask_prompt += default_agent_prompt
+        
+        with_subtask_prompt += "\n\n Now solve your given task and role instruction."
+
+        return with_subtask_prompt
+
+    def _generate(self, prompts: list[str], images: Optional[list]):
         device = self.accelerator.device
         mode = "train" if self.model.training else "eval"
 
-        prompt_ids, completion_ids, logprobs, extra_fields = self._generate_single_turn(prompts)
+        prompt_ids, completion_ids, logprobs, forward_kwargs = self._generate_single_turn(prompts, images)
 
         # Get completion length per sequence, used for logging
         prompt_lengths = torch.tensor([len(ids) for ids in prompt_ids], device=device)
@@ -1484,7 +1794,7 @@ Example format:
         self._metrics[mode]["completions/min_terminated_length"].append(term_completion_lengths.float().min().item())
         self._metrics[mode]["completions/max_terminated_length"].append(term_completion_lengths.float().max().item())
 
-        return prompt_ids, completion_ids, total_completion_tokens, logprobs, extra_fields
+        return prompt_ids, completion_ids, total_completion_tokens, logprobs, forward_kwargs
 
     def _generate_and_score_completions(
         self, inputs: list[dict[str, Union[torch.Tensor, Any]]]
@@ -1504,15 +1814,35 @@ Example format:
         if images is not None and all(img_list == [] for img_list in images):
             images = None
 
-        # If the prompts are conversational and the inputs contain images, we need to convert the prompts from
-        # [{"role": "user", "content": "What color is the sky?"}] to
-        # [{"role": "user", "content": [{"type": "image", "image": <Image>}, {"type": "text", "text": "What color is the sky?"}]}]
-        if images is not None:
-            prompts = [prepare_multimodal_messages(prompt, image_list) for prompt, image_list in zip(prompts, images)]
-
-        prompt_ids_list, completion_ids_list, num_items_in_batch, sampling_per_token_logps_list, extra_fields = (
-            self._generate(prompts)
-        )
+        # Check if this is a multi-agent workflow (has "original_question" in inputs)
+        is_multi_agent = "original_question" in inputs[0]
+        
+        if is_multi_agent:
+            # Multi-agent workflow: generate orchestrator completion first, then agent completions
+            print(f"[Rank {self.accelerator.process_index}] Starting multi-agent generation for {len(prompts)} inputs", flush=True)
+            # Note: barrier is already called in _prepare_inputs, so we don't need another one here
+            # This prevents potential deadlocks from multiple barriers
+            (
+                prompt_ids_list,
+                completion_ids_list,
+                num_items_in_batch,
+                sampling_per_token_logps_list,
+                forward_kwargs,
+                completion_types,
+                last_agent_answers,
+            ) = self._generate_multi_agent_completions(inputs, prompts)
+            print(f"[Rank {self.accelerator.process_index}] Completed _generate_multi_agent_completions", flush=True)
+        else:
+            completion_types = None
+            last_agent_answers = None
+            # Standard single-step generation
+            (
+                prompt_ids_list,
+                completion_ids_list,
+                num_items_in_batch,
+                sampling_per_token_logps_list,
+                forward_kwargs,
+            ) = self._generate(prompts, images)
 
         # Convert lists of token IDs to padded tensors
         prompt_ids = [torch.tensor(ids, device=device) for ids in prompt_ids_list]
@@ -1538,30 +1868,17 @@ Example format:
         # Concatenate prompt_mask with completion_mask for logit computation
         prompt_completion_ids = torch.cat([prompt_ids, completion_ids], dim=1)  # (B, P+C)
         attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)  # (B, P+C)
-
-        logits_to_keep = completion_ids.size(1)  # we only need to compute the logits for the completion tokens
-        batch_size = self.args.per_device_train_batch_size if mode == "train" else self.args.per_device_eval_batch_size
-
-        num_images = [len(img_list) for img_list in images] if images is not None else None
-
-        # Get forward_kwargs for models with multimodal inputs
-        if images is not None:
-            prompts_text = [
-                apply_chat_template({"prompt": prompt}, self.processing_class, **self.chat_template_kwargs)["prompt"]
-                for prompt in prompts
-            ]
-            prompt_inputs = self.processing_class(images=images, text=prompts_text, padding=True, return_tensors="pt")
-            prompt_inputs = super()._prepare_inputs(prompt_inputs)
-            forward_kwargs = {k: v for k, v in prompt_inputs.items() if k not in ["input_ids", "attention_mask"]}
-        else:
-            forward_kwargs = {}
-
         # If token_type_ids are used, extend them with zeros for the completion part
         if "token_type_ids" in forward_kwargs:
             token_type_ids = forward_kwargs["token_type_ids"]
             forward_kwargs["token_type_ids"] = torch.cat(
                 [token_type_ids, token_type_ids.new_zeros(completion_ids.shape)], dim=1
             )
+
+        logits_to_keep = completion_ids.size(1)  # we only need to compute the logits for the completion tokens
+        batch_size = self.args.per_device_train_batch_size if mode == "train" else self.args.per_device_eval_batch_size
+
+        num_images = [len(img_list) for img_list in images] if images is not None else None
 
         with torch.no_grad():
             # If the generation and optimization steps are misaligned—i.e., if generation does not occur at the end of
@@ -1631,82 +1948,12 @@ Example format:
         else:
             completions = completions_text
 
-        # Step: Parse orchestrator completions and generate agent responses
-        agent_responses_list = []
-        task_data_list = [inp.get("task_data", {}) for inp in inputs]
-        
-        for idx, (orchestrator_completion, task_data) in enumerate(zip(completions_text, task_data_list)):
-            base_question = task_data.get("instruction", "") if isinstance(task_data, dict) else ""
-            if not base_question:
-                # Fallback: try to extract from prompt
-                base_question = prompts_text[idx] if idx < len(prompts_text) else ""
-            
-            subtasks, role_instructions, is_valid = self._parse_orchestrator_output(orchestrator_completion)
-            
-            if not is_valid or not subtasks:
-                # If parsing fails, use empty agent response
-                agent_responses_list.append("")
-                continue
-            
-            # Generate agent responses for each subtask
-            history = []
-            all_agent_responses = []
-            
-            for subtask, role_instruction in zip(subtasks, role_instructions):
-                agent_messages = self._prepare_agent_messages(
-                    subtask=subtask,
-                    role_instruction=role_instruction,
-                    base_question=base_question,
-                    history=history,
-                )
-                
-                # Convert messages to prompt format
-                if is_conversational({"prompt": agent_messages}):
-                    agent_prompts = [agent_messages]
-                else:
-                    agent_prompt_text = self.processing_class.apply_chat_template(
-                        agent_messages,
-                        tokenize=False,
-                        add_generation_prompt=True,
-                        **self.chat_template_kwargs
-                    )
-                    agent_prompts = [agent_prompt_text]
-                
-                # Generate agent response using the same model
-                agent_prompt_ids, agent_completion_ids, _, _ = self._generate_single_turn(agent_prompts)
-                
-                # Decode agent response
-                agent_response_text = self.processing_class.batch_decode(
-                    [torch.tensor(ids, device=device) for ids in agent_completion_ids],
-                    skip_special_tokens=True
-                )[0]
-                
-                all_agent_responses.append(agent_response_text)
-                history.append(agent_response_text)
-            
-            # Use the last agent response as final response
-            final_agent_response = all_agent_responses[-1] if all_agent_responses else ""
-            agent_responses_list.append(final_agent_response)
-        
-        # Store agent responses in extra_fields and inputs for reward function
-        if "agent_responses" not in extra_fields:
-            extra_fields["agent_responses"] = agent_responses_list
-        else:
-            extra_fields["agent_responses"].extend(agent_responses_list)
-
-        # Merge extra_fields from rollout_func into inputs for reward functions
-        if extra_fields:
-            for i, inp in enumerate(inputs):
-                for key, values in extra_fields.items():
-                    if isinstance(values, list) and i < len(values):
-                        inp[key] = values[i]
-                    elif not isinstance(values, list):
-                        inp[key] = values
-
         # Calculate rewards for each reward function. rewards_per_func aggregates rewards across all processes. This is
         # important because rewards will be normalized per group, and completions are distributed. We will later slice
         # rewards_per_func to extract each process's subset.
-        rewards_per_func = self._calculate_rewards(inputs, prompts, completions, completion_ids_list)
+        # For multi-agent workflow, use prompts_text instead of prompts to match the length of completion_types
+        use_prompts = prompts_text if is_multi_agent else prompts
+        rewards_per_func = self._calculate_rewards(inputs, use_prompts, completions, completion_ids_list, completion_types, last_agent_answers)
 
         # Apply weights to each reward function's output and sum
         rewards = (rewards_per_func * self.reward_weights.to(device).unsqueeze(0)).nansum(dim=1)
@@ -1868,7 +2115,7 @@ Example format:
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         if return_outputs:
             raise ValueError("The GRPOTrainer does not support returning outputs")
-        if self.use_liger_kernel:
+        if self.use_liger_loss:
             # Compute the loss using the liger grpo loss
             unwrapped_model = self.accelerator.unwrap_model(model)
             return self._forward_redirection(model, unwrapped_model, self.compute_liger_loss, unwrapped_model, inputs)
@@ -2037,13 +2284,7 @@ Example format:
                     self.num_completions_to_print,
                 )
 
-            logging_backends = []
             if self.args.report_to and "wandb" in self.args.report_to and wandb.run is not None:
-                logging_backends.append(wandb)
-            if self.args.report_to and "trackio" in self.args.report_to:
-                logging_backends.append(trackio)
-
-            if logging_backends:
                 import pandas as pd
 
                 table = {
@@ -2054,28 +2295,16 @@ Example format:
                     "advantage": self._logs["advantages"],
                 }
 
-                df_base = pd.DataFrame(table)
-                images_raw = self._logs["images"] or []
+                if self._logs["images"]:
+                    table["images"] = []
+                    for image_list in self._logs["images"]:
+                        # Convert images to wandb Image objects for proper visualization
+                        table["images"].append([wandb.Image(image) for image in image_list])
 
-                for logging_backend in logging_backends:
-                    if images_raw:
-                        # Convert images per backend and derive a dataframe that shares base columns
-                        if logging_backend is wandb:
-                            images = []
-                            for image_list in self._logs["images"]:
-                                images.append([wandb.Image(image) for image in image_list])
-                            df = pd.concat([df_base, pd.Series(images, name="image")], axis=1, copy=False)
-                        elif logging_backend is trackio:
-                            # TODO: Implement once supported upstream https://github.com/gradio-app/trackio/issues/327
-                            logger.info("Skipping image logging for Trackio")
-                            df = df_base
-                    else:
-                        df = df_base
-
-                    if self.wandb_log_unique_prompts:
-                        df = df.drop_duplicates(subset=["prompt"])
-
-                    logging_backend.log({"completions": logging_backend.Table(dataframe=df)})
+                df = pd.DataFrame(table)
+                if self.wandb_log_unique_prompts:
+                    df = df.drop_duplicates(subset=["prompt"])
+                wandb.log({"completions": wandb.Table(dataframe=df)})
 
     # Ensure the model card is saved along with the checkpoint
     def _save_checkpoint(self, model, trial):

@@ -45,3 +45,5 @@ data/
 models/
 wandb/
 
+*.log
+*.out

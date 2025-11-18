@@ -1,61 +1,7 @@
-# Copyright 2020-2025 The HuggingFace Team. All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
-# /// script
-# dependencies = [
-#     "trl",
-#     "peft",
-#     "math-verify",
-#     "latex2sympy2_extended",
-#     "trackio",
-#     "kernels",
-# ]
-# ///
-
-"""
-pip install math_verify
-
-# For Qwen/Qwen3-0.6B
-pip install num2words==0.5.14
-
-accelerate launch \
-    --config_file examples/accelerate_configs/deepspeed_zero3.yaml \
-    examples/scripts/gspo.py \
-    --model_name_or_path Qwen/Qwen3-0.6B \
-    --output_dir gspo-Qwen3-0.6B \
-    --learning_rate 1e-5 \
-    --dtype bfloat16 \
-    --max_prompt_length 2048 \
-    --max_completion_length 1024 \
-    --use_peft \
-    --lora_target_modules "q_proj", "v_proj" \
-    --log_completions \
-    --per_device_train_batch_size 8 \
-    --num_generations 8 \
-    --importance_sampling_level sequence \
-    --epsilon 3e-4 \
-    --epsilon_high 4e-4 \
-    --beta 0.0 \
-    --loss_type grpo \
-    --gradient_accumulation_steps 2 \
-    --steps_per_generation 8
-
-"""
-
 import os
+import re
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, List, Dict
 
 import torch
 from datasets import load_dataset
@@ -68,13 +14,30 @@ from trl import (
     get_kbit_device_map,
     get_peft_config,
     get_quantization_config,
-    GRPOTrainer,
 )
+from davids.train.multi_train.multi_grpo_trainer import MultiGRPOTrainer
+from davids.train.utils.orchestrator_prompt import get_orchestrator_prompt, parse_orchestrator_output
+
 from davids.reward_utils.think_answer_format_reward import think_answer_format_reward
 from davids.reward_utils.math_reward import accuracy_reward
+from davids.reward_utils.orchestrator_format_reward import orchestrator_format_reward
+
+@dataclass
+class MultiGRPOConfig(GRPOConfig):
+    """Custom script arguments extending TRL's ScriptArguments."""
+
+    num_agents: int = field(
+        default=4,
+        metadata={"help": "Number of agents"},
+    )
+    
+    num_few_shot_examples: int = field(
+        default=3,
+        metadata={"help": "Number of few-shot examples"},
+    )
 
 if __name__ == "__main__":
-    parser = TrlParser((ScriptArguments, GRPOConfig, ModelConfig))
+    parser = TrlParser((ScriptArguments, MultiGRPOConfig, ModelConfig))
     script_args, training_args, model_args = parser.parse_args_and_config()
     
     # Get environment variables (set in run_single_math_train.sh)
@@ -114,38 +77,23 @@ if __name__ == "__main__":
     train_dataset = load_dataset(script_args.dataset_name, split="train")
     eval_dataset = load_dataset(script_args.dataset_name, split="test")
     
-    # dataset_dict = train_dataset.train_test_split(test_size=script_args.eval_ratio, seed=training_args.seed)
-    # train_dataset = dataset_dict["train"]
-    # eval_dataset = dataset_dict["test"]
+    ORCHESTRATOR_SYSTEM_PROMPT = """You are a helpful assistant that solve complex math problems."""
     
-    SYSTEM_PROMPT = (
-        "You are a helpful assistant that solve complex math problems."
-    )
-
     def make_conversation(example):
-        
-        user_prompt = f"""You first think about the reasoning process in the mind and then provide the answer.
-        
-        The reasoning process is enclosed within <think> and </think> tags and the final answer is enclosed within <answer> and </answer> tags.
-        
-        Example format:
-        <think>
-        [Your reasoning and thought process here]
-        </think>
-        <answer>
-        [Your final answer here]
-        </answer>
-        
-        Now, solve the following problem:
-
-        Problem: {example["problem"]}
-"""
+        """Create conversation format for orchestrator."""
+        user_prompt = get_orchestrator_prompt(
+            instruction=example["problem"], 
+            num_agents=training_args.num_agents, 
+            num_few_shot_examples=training_args.num_few_shot_examples,
+            type="math"
+        )
         return {
             "prompt": [
-                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "system", "content": ORCHESTRATOR_SYSTEM_PROMPT},
                 {"role": "user", "content": user_prompt},
             ],
-            "solution": example["answer"],  # Pass testcase as solution for bcb_accuracy_reward
+            "solution": example["answer"],
+            "original_question": example["problem"],  # Store original question for agent prompts
         }
 
     train_dataset = train_dataset.map(make_conversation)
@@ -154,10 +102,10 @@ if __name__ == "__main__":
     ################
     # Training
     ################
-    trainer = GRPOTrainer(
+    trainer = MultiGRPOTrainer(
         model=model_args.model_name_or_path,
         args=training_args,
-        reward_funcs=[accuracy_reward, think_answer_format_reward],
+        reward_funcs=[orchestrator_format_reward, think_answer_format_reward, accuracy_reward],
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         peft_config=peft_config,

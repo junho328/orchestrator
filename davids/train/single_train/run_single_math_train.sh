@@ -10,9 +10,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ORCHESTRATOR_DIR="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 
 # Default values
-MODEL_NAME=${MODEL_NAME:-"Qwen/Qwen2.5-Coder-3B-Instruct"}
-DATASET_NAME=${DATASET_NAME:-"jhn9803/hendrycks-math-with-answers"}
-OUTPUT_DIR=${OUTPUT_DIR:-"/ext_hdd/jhna/marllm"}
+MODEL_NAME=${MODEL_NAME:-"/home/work/aipr-jhna/huggingface_hub/Qwen2.5-Coder-3B-Instruct"}
+DATASET_NAME=${DATASET_NAME:-"/home/work/aipr-jhna/huggingface_hub/hendrycks-math-with-answers"}
+OUTPUT_DIR=${OUTPUT_DIR:-"/home/work/aipr-jhna/output"}
 LEARNING_RATE=${LEARNING_RATE:-1e-6}
 DTYPE=${DTYPE:-"bfloat16"}
 NUM_TRAIN_EPOCHS=${NUM_TRAIN_EPOCHS:-3}
@@ -28,20 +28,20 @@ LORA_ALPHA=${LORA_ALPHA:-32}
 LORA_DROPOUT=${LORA_DROPOUT:-0.0}
 LORA_TARGET_MODULES=${LORA_TARGET_MODULES:-"all-linear"}
 SEED=${SEED:-42}
-GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-0.8}
+GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-0.5}
 
 # Quantization: optional, set --load_in_4bit or --load_in_8bit if needed
 # LOAD_IN_4BIT=${LOAD_IN_4BIT:-""}
 # LOAD_IN_8BIT=${LOAD_IN_8BIT:-""}
 
 WANDB_PROJECT=${WANDB_PROJECT:-"single-math-train"}
-WANDB_RUN_NAME=${WANDB_RUN_NAME:-"qwen-1.5b-math-grpo-g16"}
+WANDB_RUN_NAME=${WANDB_RUN_NAME:-"qwen-3b-math-grpo-g16"}
 
 # Export environment variables so they're available to the Python script
 export WANDB_PROJECT
 export WANDB_RUN_NAME
 
-ACCELERATE_CONFIG=${ACCELERATE_CONFIG:-"/home/jhna/orchestrator/davids/configs/deepspeed_zero.yaml"}
+ACCELERATE_CONFIG=${ACCELERATE_CONFIG:-"/home/work/aipr-jhna/orchestrator/davids/configs/deepspeed_zero.yaml"}
 
 # Change to orchestrator directory for proper module imports
 cd "$ORCHESTRATOR_DIR"
@@ -65,7 +65,6 @@ accelerate launch \
     --beta "$BETA" \
     --loss_type dr_grpo \
     --use_peft \
-    # --load_in_4bit \
     --lora_r "$LORA_R" \
     --lora_alpha "$LORA_ALPHA" \
     --lora_dropout "$LORA_DROPOUT" \

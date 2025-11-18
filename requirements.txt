@@ -1,0 +1,24 @@
+torch==2.6.0
+transformers==4.57.1
+trl[vllm]
+deepspeed=0.17.0
+accelerate
+peft
+bitsandbytes
+wandb
+math_verify
+setuptools 
+ninja
+packaging
+einops 
+hjson 
+msgpack 
+numpy 
+psutil 
+py-cpuinfo 
+pydantic 
+tqdm 
+nvidia-ml-py
+#vllm==0.8.5.post1
+#pip install flash_attn==2.7.4.post1 --no-build-isolation
+
