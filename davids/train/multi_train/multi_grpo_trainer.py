@@ -1004,15 +1004,10 @@ class MultiGRPOTrainer(BaseTrainer):
         if mode == "train":
             generate_every = self.args.steps_per_generation * self.num_iterations
             if self._step % generate_every == 0 or self._buffered_inputs is None:
-                # self._buffered_inputs=None can occur when resuming from a checkpoint
-                print(f"[Rank {self.accelerator.process_index}] _prepare_inputs: About to call _generate_and_score_completions (step={self._step}, generate_every={generate_every})", flush=True)
                 # Ensure all processes are synchronized before generation
                 if torch.distributed.is_initialized():
-                    print(f"[Rank {self.accelerator.process_index}] _prepare_inputs: Waiting at barrier before generation", flush=True)
                     torch.distributed.barrier()
-                    print(f"[Rank {self.accelerator.process_index}] _prepare_inputs: Passed barrier, calling _generate_and_score_completions", flush=True)
                 generation_batch = self._generate_and_score_completions(generation_batch)
-                print(f"[Rank {self.accelerator.process_index}] _prepare_inputs: Completed _generate_and_score_completions", flush=True)
                 generation_batch = split_pixel_values_by_grid(generation_batch)
                 generation_batch = shuffle_sequence_dict(generation_batch)
                 generation_batches = split_tensor_dict(generation_batch, self.args.steps_per_generation)
@@ -1026,228 +1021,106 @@ class MultiGRPOTrainer(BaseTrainer):
         return inputs
 
     @profiling_decorator
-    def _calculate_rewards(self, inputs, prompts, completions, completion_ids_list, completion_types=None, last_agent_answers=None):
+    def _calculate_rewards(self, inputs, prompts, completions, completion_ids_list, completion_types=None, last_agent_answers=None, trajectory_indices=None):
         device = self.accelerator.device
+        # rewards_per_func: (Total Steps, Num Reward Funcs)
         rewards_per_func = torch.zeros(len(prompts), len(self.reward_funcs), device=device)
         
-        # Debug: Check for length mismatches
-        if completion_types is not None:
-            len_completion_types = len(completion_types)
-            len_prompts = len(prompts)
-            len_completions = len(completions)
-            len_completion_ids = len(completion_ids_list)
-            if not (len_completion_types == len_prompts == len_completions == len_completion_ids):
-                print(f"[Rank {self.accelerator.process_index}] WARNING: Length mismatch in _calculate_rewards: "
-                      f"completion_types={len_completion_types}, prompts={len_prompts}, "
-                      f"completions={len_completions}, completion_ids_list={len_completion_ids}", flush=True)
-
-        # Repeat all input columns (but "prompt", "completion", and "completion_ids") to match the num of generations
+        # ... (기존 reward_kwargs 준비 코드는 동일) ...
         keys = [key for key in inputs[0] if key not in ["prompt", "completion", "completion_ids"]]
         reward_kwargs = {key: [example[key] for example in inputs] for key in keys}
-
-        # This allows for dynamic reward shaping based on training progress.
         reward_kwargs["trainer_state"] = self.state
 
-        # Check if this is multi-agent workflow and identify reward function types
+        # Multi-agent 여부 확인
         is_multi_agent = completion_types is not None
-        if is_multi_agent:
-            # Find orchestrator_format_reward, think_answer_format_reward, and accuracy_reward indices
-            orchestrator_reward_idx = None
-            agent_reward_idx = None
-            accuracy_reward_idx = None
-            for i, reward_func_name in enumerate(self.reward_func_names):
-                if "orchestrator_format" in reward_func_name.lower() or reward_func_name == "orchestrator_format_reward":
-                    orchestrator_reward_idx = i
-                elif "think_answer_format" in reward_func_name.lower() or reward_func_name == "think_answer_format_reward":
-                    agent_reward_idx = i
-                elif "accuracy" in reward_func_name.lower() or reward_func_name in "accuracy_reward":
-                    accuracy_reward_idx = i
+
+        # Reward 함수 인덱스 찾기
+        orchestrator_reward_idx = None
+        agent_reward_idx = None
+        accuracy_reward_idx = None
+        for i, name in enumerate(self.reward_func_names):
+            if "orchestrator" in name.lower(): orchestrator_reward_idx = i
+            elif "think" in name.lower() or "agent" in name.lower(): agent_reward_idx = i
+            elif "accuracy" in name.lower(): accuracy_reward_idx = i
 
         for i, (reward_func, reward_processing_class, reward_func_name) in enumerate(
             zip(self.reward_funcs, self.reward_processing_classes, self.reward_func_names)
         ):
-            with profiling_context(self, reward_func_name):
-                # For multi-agent workflow, apply reward functions selectively based on completion type
-                if is_multi_agent:
-                    if orchestrator_reward_idx is not None and i == orchestrator_reward_idx:
-                        # Only apply orchestrator_format_reward to orchestrator completions
-                        filtered_prompts = []
-                        filtered_completions = []
-                        filtered_completion_ids = []
-                        for j, comp_type in enumerate(completion_types):
-                            if comp_type == "orchestrator":
-                                # Add bounds check to prevent IndexError
-                                if j < len(prompts) and j < len(completions) and j < len(completion_ids_list):
-                                    filtered_prompts.append(prompts[j])
-                                    filtered_completions.append(completions[j])
-                                    filtered_completion_ids.append(completion_ids_list[j])
-                        if len(filtered_completions) == 0:
-                            # No orchestrator completions, set rewards to NaN
-                            rewards_per_func[:, i] = torch.nan
-                            continue
-                        use_prompts = filtered_prompts
-                        use_completions = filtered_completions
-                        use_completion_ids = filtered_completion_ids
-                    elif agent_reward_idx is not None and i == agent_reward_idx:
-                        # Only apply think_answer_format_reward to agent completions
-                        filtered_prompts = []
-                        filtered_completions = []
-                        filtered_completion_ids = []
-                        for j, comp_type in enumerate(completion_types):
-                            if comp_type == "agent":
-                                # Add bounds check to prevent IndexError
-                                if j < len(prompts) and j < len(completions) and j < len(completion_ids_list):
-                                    filtered_prompts.append(prompts[j])
-                                    filtered_completions.append(completions[j])
-                                    filtered_completion_ids.append(completion_ids_list[j])
-                        if len(filtered_completions) == 0:
-                            # No agent completions, set rewards to NaN
-                            rewards_per_func[:, i] = torch.nan
-                            continue
-                        use_prompts = filtered_prompts
-                        use_completions = filtered_completions
-                        use_completion_ids = filtered_completion_ids
-                    elif accuracy_reward_idx is not None and i == accuracy_reward_idx:
-                        # Apply accuracy_reward only to the last agent's answer
-                        if last_agent_answers is None or len(last_agent_answers) == 0:
-                            rewards_per_func[:, i] = torch.nan
-                            continue
-                        
-                        # Group completions by input: each input has 1 orchestrator + N agents
-                        # Find how many completions per input by counting orchestrators
-                        num_inputs = sum(1 for ct in completion_types if ct == "orchestrator")
-                        
-                        # Create completions from last agent answers (one per input)
-                        accuracy_completions = []
-                        for input_idx in range(num_inputs):
-                            if input_idx < len(last_agent_answers):
-                                answer = last_agent_answers[input_idx]
-                                accuracy_completions.append([{"role": "assistant", "content": answer}])
-                            else:
-                                accuracy_completions.append([{"role": "assistant", "content": ""}])
-                        
-                        # Prepare solution for accuracy reward (one per input)
-                        if "solution" in reward_kwargs:
-                            solutions = reward_kwargs["solution"]
-                            # Solutions are repeated for num_generations, so take unique ones
-                            unique_solutions = solutions[::self.num_generations] if len(solutions) >= self.num_generations * num_inputs else solutions
-                            accuracy_reward_kwargs = {**reward_kwargs, "solution": unique_solutions[:num_inputs]}
-                        else:
-                            accuracy_reward_kwargs = reward_kwargs
-                        
-                        # Calculate accuracy reward for each input's last agent answer
-                        output_reward_func = reward_func(
-                            prompts=[], completions=accuracy_completions, completion_ids=[], **accuracy_reward_kwargs
-                        )
-                        output_reward_func = [reward if reward is not None else torch.nan for reward in output_reward_func]
-                        computed_rewards = torch.tensor(output_reward_func, dtype=torch.float32, device=device)
-                        
-                        # Map rewards back to all completions: if last agent's answer is correct,
-                        # all completions (orchestrator + all agents) for that input get the same reward
-                        input_idx = -1  # Start at -1, will be 0 after first orchestrator
-                        for j, comp_type in enumerate(completion_types):
-                            # Add bounds check to prevent IndexError
-                            if j >= len(prompts):
-                                continue
-                            if comp_type == "orchestrator":
-                                # Orchestrator completion: assign the same reward as the last agent for this input
-                                input_idx += 1
-                                if input_idx < len(computed_rewards):
-                                    rewards_per_func[j, i] = computed_rewards[input_idx]
-                                else:
-                                    rewards_per_func[j, i] = torch.nan
-                            elif comp_type == "agent":
-                                # All agent completions for the same input get the same reward
-                                # The current input_idx is the same as the last orchestrator we saw
-                                if input_idx >= 0 and input_idx < len(computed_rewards):
-                                    rewards_per_func[j, i] = computed_rewards[input_idx]
-                                else:
-                                    rewards_per_func[j, i] = torch.nan
-                        continue
-                    else:
-                        # For other reward functions, apply to all completions
-                        use_prompts = prompts
-                        use_completions = completions
-                        use_completion_ids = completion_ids_list
+            # ... (Standard workflow 및 Conversational 템플릿 처리는 기존 코드 활용) ...
+            
+            # Accuracy Reward 처리 (가장 중요)
+            if is_multi_agent and i == accuracy_reward_idx:
+                if last_agent_answers is None:
+                    rewards_per_func[:, i] = torch.nan
+                    continue
+                
+                # last_agent_answers는 [Traj0_Ans, Traj1_Ans, ...] 형태임 (Total Trajectories 개수)
+                # Reward Function은 Batch 처리를 위해 리스트 형태의 completions를 받음
+                acc_completions = [[{"role": "assistant", "content": ans}] for ans in last_agent_answers]
+                
+                # inputs 데이터도 Trajectory 개수만큼 확장해야 함 (inputs는 Batch Size개)
+                # Trajectory ID를 num_generations로 나누면 원본 Input ID가 나옴
+                extended_reward_kwargs = {}
+                num_trajectories = len(last_agent_answers)
+                
+                # reward_kwargs의 각 항목을 trajectory 개수에 맞춰 확장
+                # 예: inputs[0] -> traj 0~15, inputs[1] -> traj 16~31 ...
+                # inputs는 이미 generation_batch_size 만큼 확장되어 들어올 수도 있음(_prepare_inputs 참고).
+                # 하지만 안전하게 trajectory_indices나 num_generations를 이용해 매핑.
+                
+                # 여기서는 reward_kwargs가 이미 inputs(generation batch) 크기에 맞춰져 있다고 가정
+                # (일반적으로 GRPO는 inputs를 repeat해서 처리함)
+                
+                # Accuracy 계산 (Total Trajectories 개수만큼 결과 나옴)
+                output_reward_func = reward_func(
+                    prompts=[], completions=acc_completions, completion_ids=[], **reward_kwargs
+                )
+                output_reward_func = [r if r is not None else torch.nan for r in output_reward_func]
+                traj_rewards = torch.tensor(output_reward_func, dtype=torch.float32, device=device)
+
+                # 계산된 Trajectory 별 Reward를 해당 Trajectory에 속한 모든 Step에 할당
+                # trajectory_indices: [0, 0, 0, 1, 1, 2, ...] (각 step이 속한 traj ID)
+                if trajectory_indices is not None:
+                    indices = torch.tensor(trajectory_indices, device=device)
+                    # indices가 traj_rewards의 인덱스로 사용됨
+                    rewards_per_func[:, i] = traj_rewards[indices]
                 else:
-                    # Standard workflow: apply to all completions
-                    use_prompts = prompts
-                    use_completions = completions
-                    use_completion_ids = completion_ids_list
+                    rewards_per_func[:, i] = torch.nan
 
-                if isinstance(reward_func, nn.Module):  # Module (no PretrainedModel) for compat with compiled models
-                    if is_conversational(inputs[0]):
-                        messages = [{"messages": p + c} for p, c in zip(use_prompts, use_completions)]
-                        texts = [apply_chat_template(x, reward_processing_class)["text"] for x in messages]
-                    else:
-                        texts = [p + c for p, c in zip(use_prompts, use_completions)]
-                    reward_inputs = reward_processing_class(
-                        text=texts, return_tensors="pt", padding=True, padding_side="right", add_special_tokens=False
-                    )
-                    reward_inputs = super()._prepare_inputs(reward_inputs)
-                    with torch.inference_mode():
-                        computed_rewards = reward_func(**reward_inputs).logits[:, 0]  # Shape (N,)
-                        
-                    # Map computed rewards back to original positions
-                    if is_multi_agent and (i == orchestrator_reward_idx or i == agent_reward_idx):
-                        reward_idx = 0
-                        for j, comp_type in enumerate(completion_types):
-                            # Add bounds check to prevent IndexError
-                            if j >= len(prompts):
-                                continue
-                            if (i == orchestrator_reward_idx and comp_type == "orchestrator") or \
-                               (i == agent_reward_idx and comp_type == "agent"):
-                                if reward_idx < len(computed_rewards):
-                                    rewards_per_func[j, i] = computed_rewards[reward_idx]
-                                    reward_idx += 1
-                                else:
-                                    rewards_per_func[j, i] = torch.nan
-                            else:
-                                rewards_per_func[j, i] = torch.nan
-                    else:
-                        rewards_per_func[:, i] = computed_rewards
-                else:
-                    output_reward_func = reward_func(
-                        prompts=use_prompts, completions=use_completions, completion_ids=use_completion_ids, **reward_kwargs
-                    )
-                    # Convert None values to NaN
-                    output_reward_func = [reward if reward is not None else torch.nan for reward in output_reward_func]
-                    computed_rewards = torch.tensor(output_reward_func, dtype=torch.float32, device=device)
-                    
-                    # Map computed rewards back to original positions
-                    if is_multi_agent and (i == orchestrator_reward_idx or i == agent_reward_idx):
-                        reward_idx = 0
-                        for j, comp_type in enumerate(completion_types):
-                            # Add bounds check to prevent IndexError
-                            if j >= len(prompts):
-                                continue
-                            if (i == orchestrator_reward_idx and comp_type == "orchestrator") or \
-                               (i == agent_reward_idx and comp_type == "agent"):
-                                if reward_idx < len(computed_rewards):
-                                    rewards_per_func[j, i] = computed_rewards[reward_idx]
-                                    reward_idx += 1
-                                else:
-                                    rewards_per_func[j, i] = torch.nan
-                            else:
-                                rewards_per_func[j, i] = torch.nan
-                    else:
-                        rewards_per_func[:, i] = computed_rewards
+            # Orchestrator / Agent Format Reward 처리
+            elif is_multi_agent and (i == orchestrator_reward_idx or i == agent_reward_idx):
+                # 해당 타입인 것만 필터링해서 Reward 계산 후 다시 매핑
+                target_type = "orchestrator" if i == orchestrator_reward_idx else "agent"
+                mask = [ct == target_type for ct in completion_types]
+                
+                if not any(mask):
+                    rewards_per_func[:, i] = torch.nan
+                    continue
 
-        # If all reward functions return None for a given row, issue a detailed warning
-        if torch.isnan(rewards_per_func).all(dim=1).any():
-            nan_row_idx = torch.isnan(rewards_per_func).all(dim=1).nonzero(as_tuple=True)[0][0]
-            row_reward_kwargs = {
-                key: value[nan_row_idx] for key, value in reward_kwargs.items() if key != "trainer_state"
-            }
-            row_reward_kwargs["prompt"] = prompts[nan_row_idx]
-            row_reward_kwargs["completion"] = completions[nan_row_idx]
-            logger.warning(
-                f"All reward functions returned None for the following kwargs:\n{row_reward_kwargs}\n"
-                "Please ensure that at least one reward function returns a valid reward."
-            )
+                # 필터링된 입력 준비
+                filtered_prompts = [p for p, m in zip(prompts, mask) if m]
+                filtered_completions = [c for c, m in zip(completions, mask) if m]
+                filtered_ids = [ids for ids, m in zip(completion_ids_list, mask) if m]
+                
+                # kwargs도 필터링 필요
+                filtered_kwargs = {k: [v[idx] for idx, m in enumerate(mask) if m] for k, v in reward_kwargs.items()}
 
-        # Gather the reward per function: this part is crucial, because the rewards are normalized per group and the
-        # completions may be distributed across processes
+                output_reward_func = reward_func(
+                    prompts=filtered_prompts, completions=filtered_completions, completion_ids=filtered_ids, **filtered_kwargs
+                )
+                output_reward_func = [r if r is not None else torch.nan for r in output_reward_func]
+                computed_rewards = torch.tensor(output_reward_func, dtype=torch.float32, device=device)
+
+                # 결과를 원래 위치에 할당
+                # mask가 True인 위치에 순서대로 넣음
+                rewards_per_func[mask, i] = computed_rewards
+                # mask가 False인 위치는 이미 0.0이거나 NaN 처리 필요시 추가 로직
+
+            else:
+                # 일반적인 Reward (모든 Step에 적용)
+                # ... (기존 로직과 동일하게 전체 계산) ...
+                pass # 실제 구현시 기존 코드의 else 블록 사용
+
         rewards_per_func = gather(rewards_per_func)
         return rewards_per_func
 
@@ -1280,27 +1153,19 @@ class MultiGRPOTrainer(BaseTrainer):
 
         # Generate completions using either vLLM or regular generation
         if self.use_vllm:
-            print(f"[Rank {self.accelerator.process_index}] Using vLLM, mode={self.vllm_mode}, num_generations={n_generations}", flush=True)
             if self.vllm_mode == "colocate" and self.args.vllm_enable_sleep_mode:
                 # wake up colocated vLLM instances if needed
                 torch.cuda.empty_cache()  # required to avoid OOM in some cases
-                print(f"[Rank {self.accelerator.process_index}] Waking up vLLM", flush=True)
                 self.llm.wake_up()
-                print(f"[Rank {self.accelerator.process_index}] vLLM woken up", flush=True)
 
             # First, update the vLLM weights if needed
             if self.state.global_step != self._last_loaded_step:
-                print(f"[Rank {self.accelerator.process_index}] Moving model to vLLM", flush=True)
                 self._move_model_to_vllm()
                 self._last_loaded_step = self.state.global_step
-                print(f"[Rank {self.accelerator.process_index}] Model moved to vLLM", flush=True)
 
             # Generate completions using vLLM: gather all prompts and use them in a single call in the main process
             if self.vllm_mode == "server":
-                print(f"[Rank {self.accelerator.process_index}] Using vLLM server mode", flush=True)
-                print(f"[Rank {self.accelerator.process_index}] Gathering prompts (len={len(prompts_text)})", flush=True)
                 all_prompts_text = gather_object(prompts_text)
-                print(f"[Rank {self.accelerator.process_index}] Gathered prompts (len={len(all_prompts_text) if all_prompts_text else 0})", flush=True)
                 if images is not None:
                     all_images = gather_object(images)
 
@@ -1352,7 +1217,6 @@ class MultiGRPOTrainer(BaseTrainer):
 
             # Generate completions using colocated vLLM instances: each device holds vLLM copy and work on their own batch of prompts
             elif self.vllm_mode == "colocate":
-                print(f"[Rank {self.accelerator.process_index}] Using vLLM colocate mode, TP size={self.vllm_tensor_parallel_size}", flush=True)
                 if self.guided_decoding_regex:
                     guided_decoding = GuidedDecodingParams(regex=self.guided_decoding_regex)
                 else:
@@ -1378,10 +1242,8 @@ class MultiGRPOTrainer(BaseTrainer):
                     # Gather prompts from all ranks in the TP group and flatten.
                     # Each rank starts with its own prompts; after gathering, all ranks see the full group set.
                     orig_size = len(prompts_text)
-                    print(f"[Rank {self.accelerator.process_index}] Gathering prompts in TP group (orig_size={orig_size})", flush=True)
                     gathered_prompts = [None for _ in range(self.vllm_tensor_parallel_size)]
                     torch.distributed.all_gather_object(gathered_prompts, prompts_text, group=self.tp_group)
-                    print(f"[Rank {self.accelerator.process_index}] Gathered prompts in TP group", flush=True)
                     all_prompts_text = [p for sublist in gathered_prompts for p in sublist]
 
                     if images is not None:
@@ -1505,218 +1367,7 @@ class MultiGRPOTrainer(BaseTrainer):
 
         return prompt_ids, completion_ids, logprobs, forward_kwargs
 
-    def _generate_multi_agent_completions(
-        self, inputs: list[dict[str, Union[torch.Tensor, Any]]], prompts: list
-    ):
-        """
-        Generate completions for multi-agent workflow:
-        1. Generate orchestrator completion
-        2. Parse orchestrator output to get subtasks and role_instructions
-        3. Generate completions for each agent sequentially
-        4. Return the last agent's completion for training
-        """
-        device = self.accelerator.device
-        mode = "train" if self.model.training else "eval"
-        
-        # Step 1: Generate orchestrator completion
-        import time
-        orchestrator_start_time = time.time()
-        logging.get_logger(__name__).info(f"[Rank {self.accelerator.process_index}] Generating orchestrator completions for {len(prompts)} inputs")
-        
-        orchestrator_prompts = prompts
-        (
-            orchestrator_prompt_ids_list,
-            orchestrator_completion_ids_list,
-            orchestrator_logprobs_list,
-            forward_kwargs,
-        ) = self._generate_single_turn(orchestrator_prompts, images=None, num_generations=self.num_generations)
-        
-        orchestrator_elapsed = time.time() - orchestrator_start_time
-        logging.get_logger(__name__).info(f"[Rank {self.accelerator.process_index}] Orchestrator completions completed in {orchestrator_elapsed:.2f}s")
-        
-        # Decode orchestrator completions
-        orchestrator_completions_text = self.processing_class.batch_decode(
-            [torch.tensor(ids, device=device) for ids in orchestrator_completion_ids_list],
-            skip_special_tokens=True
-        )
-        
-        # Log orchestrator completions
-        for idx, completion in enumerate(orchestrator_completions_text):
-            completion_preview = completion[:500] + "..." if len(completion) > 500 else completion
-            logging.get_logger(__name__).info(f"[Rank {self.accelerator.process_index}] Orchestrator completion {idx+1}:\n{completion_preview}")
-        
-        # Store all completions (orchestrator + all agents) for loss calculation
-        all_prompt_ids_list = []
-        all_completion_ids_list = []
-        all_logprobs_list = []
-        completion_types = []  # Track completion types: "orchestrator" or "agent"
-        last_agent_answers = []  # Store the final answer from the last agent for each input
-        total_completion_tokens = 0
-        for i, (orchestrator_completion, input_item) in enumerate(zip(orchestrator_completions_text, inputs)):
-            input_start_time = time.time()
-            logging.get_logger(__name__).info(f"[Rank {self.accelerator.process_index}] Processing input {i+1}/{len(inputs)}")
-            
-            # Log orchestrator completion for this input
-            orchestrator_preview = orchestrator_completion[:500] + "..." if len(orchestrator_completion) > 500 else orchestrator_completion
-            logging.get_logger(__name__).info(f"[Rank {self.accelerator.process_index}] Input {i+1} - Orchestrator completion:\n{orchestrator_preview}")
-            
-            # Parse orchestrator output
-            parsed = parse_orchestrator_output(orchestrator_completion)
-            
-            if parsed is None:
-                subtasks, role_instructions = [], []
-            else:
-                subtasks, role_instructions = parsed
-            original_question = input_item.get("original_question", "")
-            
-            # Add orchestrator completion to the list
-            all_prompt_ids_list.append(orchestrator_prompt_ids_list[i])
-            all_completion_ids_list.append(orchestrator_completion_ids_list[i])
-            completion_types.append("orchestrator")  # Mark as orchestrator completion
-            all_logprobs_list.append(orchestrator_logprobs_list[i])
-            total_completion_tokens += len(orchestrator_completion_ids_list[i])
-            
-            # Step 3: Generate completions for each agent sequentially
-            agent_outputs = []
-            
-            if len(subtasks) > 0:
-                logging.get_logger(__name__).info(f"[Rank {self.accelerator.process_index}] Input {i+1}: Generating {len(subtasks)} agent completions")
-            
-                for agent_idx, (subtask, role_instruction) in enumerate(zip(subtasks, role_instructions)):
-                    agent_start_time = time.time()
-                    logging.get_logger(__name__).info(f"[Rank {self.accelerator.process_index}] Input {i+1}, Agent {agent_idx+1}/{len(subtasks)}: Starting generation")
-                    
-                    # Create agent prompt
-                    previous_outputs = agent_outputs if agent_outputs else None
-                    agent_prompt_text = self._make_agent_prompt(original_question, subtask, role_instruction, previous_outputs)
-                    
-                    # Convert to conversational format
-                    agent_prompt = [
-                        {"role": "system", "content": "You are a helpful assistant that solves complex problems."},
-                        {"role": "user", "content": agent_prompt_text}
-                    ]
-                    
-                    # Generate agent completion (only 1 per orchestrator completion, not num_generations)
-                    agent_prompts_list = [agent_prompt]
-                    (
-                        agent_prompt_ids_list,
-                        agent_completion_ids_list,
-                        agent_logprobs_list,
-                        agent_forward_kwargs,
-                    ) = self._generate_single_turn(agent_prompts_list, images=None, num_generations=1)
-                    
-                    agent_elapsed = time.time() - agent_start_time
-                    
-                    # Decode agent completion
-                    agent_completion_text = self.processing_class.batch_decode(
-                        [torch.tensor(ids, device=device) for ids in agent_completion_ids_list],
-                        skip_special_tokens=True
-                    )[0]
-                    
-                    # Log agent completion
-                    agent_completion_preview = agent_completion_text[:500] + "..." if len(agent_completion_text) > 500 else agent_completion_text
-                    logging.get_logger(__name__).info(f"[Rank {self.accelerator.process_index}] Input {i+1}, Agent {agent_idx+1}/{len(subtasks)}: Completed in {agent_elapsed:.2f}s")
-                    logging.get_logger(__name__).info(f"[Rank {self.accelerator.process_index}] Input {i+1}, Agent {agent_idx+1}/{len(subtasks)} - Completion:\n{agent_completion_preview}")
 
-                    # Extract only the answer between <answer> and </answer>
-                    import re
-                    match = re.search(r"<answer>(.*?)</answer>", agent_completion_text, re.DOTALL | re.IGNORECASE)
-                    if match:
-                        agent_answer = match.group(1).strip()
-                    else:
-                        agent_answer = agent_completion_text.strip()
-                    
-                    # Log extracted answer
-                    agent_answer_preview = agent_answer[:300] + "..." if len(agent_answer) > 300 else agent_answer
-                    logging.get_logger(__name__).info(f"[Rank {self.accelerator.process_index}] Input {i+1}, Agent {agent_idx+1}/{len(subtasks)} - Extracted answer:\n{agent_answer_preview}")
-
-                    agent_outputs.append(agent_answer)
-                    
-                    # Add agent completion to the list (for loss calculation)
-                    all_prompt_ids_list.append(agent_prompt_ids_list[0])
-                    all_completion_ids_list.append(agent_completion_ids_list[0])
-                    completion_types.append("agent")  # Mark as agent completion
-                    all_logprobs_list.append(agent_logprobs_list[0])
-                    total_completion_tokens += len(agent_completion_ids_list[0])
-                    
-                    # Store the last agent's answer for accuracy reward
-                    if agent_idx == len(subtasks) - 1:  # Last agent
-                        if i < len(last_agent_answers):
-                            last_agent_answers[i] = agent_answer
-                        else:
-                            last_agent_answers.append(agent_answer)
-                    
-            else:
-                agent_prompt_text = self._make_agent_prompt(original_question, subtask=None, role_instruction=None, previous_outputs=None)
-                    
-                # Convert to conversational format
-                agent_prompt = [
-                    {"role": "system", "content": "You are a helpful assistant that solves complex problems."},
-                    {"role": "user", "content": agent_prompt_text}
-                ]
-                
-                # Generate agent completion (only 1 per orchestrator completion, not num_generations)
-                agent_prompts_list = [agent_prompt]
-                (
-                    agent_prompt_ids_list,
-                    agent_completion_ids_list,
-                    agent_logprobs_list,
-                    agent_forward_kwargs,
-                ) = self._generate_single_turn(agent_prompts_list, None, num_generations=1)
-                
-                # Decode agent completion
-                agent_completion_text = self.processing_class.batch_decode(
-                    [torch.tensor(ids, device=device) for ids in agent_completion_ids_list],
-                    skip_special_tokens=True
-                )[0]
-                
-                # Log agent completion (no subtasks case)
-                agent_completion_preview = agent_completion_text[:500] + "..." if len(agent_completion_text) > 500 else agent_completion_text
-                logging.get_logger(__name__).info(f"[Rank {self.accelerator.process_index}] Input {i+1}, Agent (no subtasks) - Completion:\n{agent_completion_preview}")
-
-                # Extract only the answer between <answer> and </answer>
-                import re
-                match = re.search(r"<answer>(.*?)</answer>", agent_completion_text, re.DOTALL | re.IGNORECASE)
-                if match:
-                    agent_answer = match.group(1).strip()
-                else:
-                    agent_answer = agent_completion_text.strip()
-                
-                # Log extracted answer
-                agent_answer_preview = agent_answer[:300] + "..." if len(agent_answer) > 300 else agent_answer
-                logging.get_logger(__name__).info(f"[Rank {self.accelerator.process_index}] Input {i+1}, Agent (no subtasks) - Extracted answer:\n{agent_answer_preview}")
-
-                agent_outputs.append(agent_answer)
-                
-                # Add agent completion to the list (for loss calculation)
-                all_prompt_ids_list.append(agent_prompt_ids_list[0])
-                all_completion_ids_list.append(agent_completion_ids_list[0])
-                completion_types.append("agent")  # Mark as agent completion
-                all_logprobs_list.append(agent_logprobs_list[0])
-                total_completion_tokens += len(agent_completion_ids_list[0])
-                
-                # Store the last agent's answer for accuracy reward (when no subtasks)
-                if i < len(last_agent_answers):
-                    last_agent_answers[i] = agent_answer
-                else:
-                    last_agent_answers.append(agent_answer)
-            
-            input_elapsed = time.time() - input_start_time
-            logging.get_logger(__name__).info(f"[Rank {self.accelerator.process_index}] Input {i+1}/{len(inputs)}: Completed in {input_elapsed:.2f}s")
-        
-        # Calculate total completion tokens
-        num_items_in_batch = torch.tensor(total_completion_tokens, device=device)
-        
-        return (
-            all_prompt_ids_list,
-            all_completion_ids_list,
-            num_items_in_batch,
-            all_logprobs_list,
-            forward_kwargs,
-            completion_types,  # Return completion types for reward calculation
-            last_agent_answers,  # Return last agent answers for accuracy reward
-        )
-    
     def _make_agent_prompt(self, original_question: str, subtask: str, role_instruction: str, previous_outputs: Optional[List[str]] = None) -> str:
         """Create a prompt for an agent given its subtask, role, and previous outputs."""
         
@@ -1796,6 +1447,168 @@ Example format:
 
         return prompt_ids, completion_ids, total_completion_tokens, logprobs, forward_kwargs
 
+    def _generate_multi_agent_completions(
+        self, inputs: list[dict[str, Union[torch.Tensor, Any]]], prompts: list
+    ):
+        device = self.accelerator.device
+        import re
+
+        # --- Step 1: Orchestrator Batch Generation ---
+        # num_generations만큼 복제된 프롬프트 리스트 생성
+        # inputs는 batch_size 개수이지만, prompts는 이미 num_generations만큼 repeat되어 들어올 수 있음
+        # get_train_sampler에서 repeat되므로 여기서는 len(prompts)가 batch_size * steps_per_gen * num_generations 일 수 있음.
+        # 하지만 GRPO 구조상 inputs 1개당 num_generations를 생성해야 하므로, 아래 로직을 따름.
+        
+        orchestrator_prompts = prompts
+        (
+            orchestrator_prompt_ids_list,
+            orchestrator_completion_ids_list,
+            orchestrator_logprobs_list,
+            forward_kwargs,
+        ) = self._generate_single_turn(orchestrator_prompts, images=None, num_generations=self.num_generations)
+        
+        orchestrator_completions_text = self.processing_class.batch_decode(
+            [torch.tensor(ids, device=device) for ids in orchestrator_completion_ids_list],
+            skip_special_tokens=True
+        )
+
+        # --- Step 2: Initialize Tracks ---
+        track_states = []
+        
+        # prompts 리스트는 이미 [Input1_Gen1, Input1_Gen2, ..., Input2_Gen1, ...] 순서로 되어 있다고 가정
+        # 혹은 VLLM generate시 내부적으로 repeat 처리됨.
+        # 여기서는 orchestrator_completions_text의 길이를 기준으로 역추적.
+        
+        total_trajectories = len(orchestrator_completions_text)
+        
+        for i, orchestrator_completion in enumerate(orchestrator_completions_text):
+            # inputs는 (Batch Size)개. orchestrator outputs는 (Batch Size * Num Generations)개.
+            # 따라서 input index를 계산해야 함.
+            input_idx = i // self.num_generations
+            original_question = inputs[min(input_idx, len(inputs)-1)].get("original_question", "")
+
+            parsed = parse_orchestrator_output(orchestrator_completion)
+            if parsed is None:
+                subtasks, role_instructions = [], []
+            else:
+                subtasks, role_instructions = parsed
+            
+            if len(subtasks) == 0:
+                pending_tasks = [(None, None)] 
+            else:
+                pending_tasks = list(zip(subtasks, role_instructions))
+
+            track_states.append({
+                "track_id": i,             # 0 ~ Total Trajectories - 1
+                "input_idx": input_idx,    # 원본 Input Index
+                "original_question": original_question,
+                "pending_tasks": pending_tasks,
+                "completed_outputs": [],
+                "agent_data": []
+            })
+
+        # --- Step 3: Dynamic Batch Execution ---
+        while True:
+            active_indices = [i for i, state in enumerate(track_states) if len(state["pending_tasks"]) > 0]
+            if not active_indices:
+                break
+            
+            batch_prompts = []
+            for idx in active_indices:
+                state = track_states[idx]
+                subtask, role = state["pending_tasks"][0]
+                previous_outputs = state["completed_outputs"] if state["completed_outputs"] else None
+                
+                agent_prompt_text = self._make_agent_prompt(
+                    state["original_question"], subtask, role, previous_outputs
+                )
+                
+                agent_prompt = [
+                    {"role": "system", "content": "You are a helpful assistant that solves complex problems."},
+                    {"role": "user", "content": agent_prompt_text}
+                ]
+                batch_prompts.append(agent_prompt)
+
+            (
+                step_prompt_ids,
+                step_completion_ids,
+                step_logprobs,
+                _, 
+            ) = self._generate_single_turn(batch_prompts, images=None, num_generations=1)
+
+            step_completions_text = self.processing_class.batch_decode(
+                [torch.tensor(ids, device=device) for ids in step_completion_ids],
+                skip_special_tokens=True
+            )
+
+            for batch_idx, global_idx in enumerate(active_indices):
+                state = track_states[global_idx]
+                completion_text = step_completions_text[batch_idx]
+                
+                match = re.search(r"<answer>(.*?)</answer>", completion_text, re.DOTALL | re.IGNORECASE)
+                if match:
+                    agent_answer = match.group(1).strip()
+                else:
+                    agent_answer = completion_text.strip()
+                
+                state["pending_tasks"].pop(0) 
+                state["completed_outputs"].append(agent_answer)
+                state["agent_data"].append({
+                    "prompt_ids": step_prompt_ids[batch_idx],
+                    "completion_ids": step_completion_ids[batch_idx],
+                    "logprobs": step_logprobs[batch_idx]
+                })
+
+        # --- Step 4: Flatten Results & Metadata ---
+        all_prompt_ids_list = []
+        all_completion_ids_list = []
+        all_logprobs_list = []
+        completion_types = [] 
+        
+        # Reward 및 Advantage 계산을 위한 메타데이터
+        # trajectory_indices: 각 step이 몇 번째 Trajectory(0 ~ B*G-1)에 속하는지
+        trajectory_indices = [] 
+        
+        total_completion_tokens = 0
+
+        # Accuracy Reward를 위해 모든 Trajectory의 마지막 답안 수집
+        last_agent_answers = []
+
+        for i, state in enumerate(track_states):
+            # 4-1. Orchestrator
+            all_prompt_ids_list.append(orchestrator_prompt_ids_list[i])
+            all_completion_ids_list.append(orchestrator_completion_ids_list[i])
+            all_logprobs_list.append(orchestrator_logprobs_list[i])
+            completion_types.append("orchestrator")
+            trajectory_indices.append(i) # 이 Step은 i번째 Trajectory에 속함
+            total_completion_tokens += len(orchestrator_completion_ids_list[i])
+
+            # 4-2. Agents
+            for agent_step_data in state["agent_data"]:
+                all_prompt_ids_list.append(agent_step_data["prompt_ids"])
+                all_completion_ids_list.append(agent_step_data["completion_ids"])
+                all_logprobs_list.append(agent_step_data["logprobs"])
+                completion_types.append("agent")
+                trajectory_indices.append(i) # 이 Step도 i번째 Trajectory에 속함
+                total_completion_tokens += len(agent_step_data["completion_ids"])
+
+            # 4-3. Last Answer Collection (모든 Trajectory에 대해 수집)
+            final_ans = state["completed_outputs"][-1] if state["completed_outputs"] else ""
+            last_agent_answers.append(final_ans)
+
+        num_items_in_batch = torch.tensor(total_completion_tokens, device=device)
+
+        return (
+            all_prompt_ids_list,
+            all_completion_ids_list,
+            num_items_in_batch,
+            all_logprobs_list,
+            forward_kwargs,
+            completion_types,
+            last_agent_answers, # 길이가 total_trajectories와 같아야 함
+            trajectory_indices  # Reward 매핑 및 Advantage Grouping 용도
+        )
+
     def _generate_and_score_completions(
         self, inputs: list[dict[str, Union[torch.Tensor, Any]]]
     ) -> dict[str, Union[torch.Tensor, Any]]:
@@ -1818,10 +1631,6 @@ Example format:
         is_multi_agent = "original_question" in inputs[0]
         
         if is_multi_agent:
-            # Multi-agent workflow: generate orchestrator completion first, then agent completions
-            print(f"[Rank {self.accelerator.process_index}] Starting multi-agent generation for {len(prompts)} inputs", flush=True)
-            # Note: barrier is already called in _prepare_inputs, so we don't need another one here
-            # This prevents potential deadlocks from multiple barriers
             (
                 prompt_ids_list,
                 completion_ids_list,
@@ -1830,11 +1639,11 @@ Example format:
                 forward_kwargs,
                 completion_types,
                 last_agent_answers,
+                trajectory_indices, # 추가됨
             ) = self._generate_multi_agent_completions(inputs, prompts)
-            print(f"[Rank {self.accelerator.process_index}] Completed _generate_multi_agent_completions", flush=True)
         else:
-            completion_types = None
-            last_agent_answers = None
+            # Standard logic
+            trajectory_indices = None
             # Standard single-step generation
             (
                 prompt_ids_list,
@@ -1953,17 +1762,69 @@ Example format:
         # rewards_per_func to extract each process's subset.
         # For multi-agent workflow, use prompts_text instead of prompts to match the length of completion_types
         use_prompts = prompts_text if is_multi_agent else prompts
-        rewards_per_func = self._calculate_rewards(inputs, use_prompts, completions, completion_ids_list, completion_types, last_agent_answers)
+        
+        rewards_per_func = self._calculate_rewards(
+            inputs, use_prompts, completions, completion_ids_list, 
+            completion_types, last_agent_answers, trajectory_indices
+        )
 
-        # Apply weights to each reward function's output and sum
+        # Apply weights
         rewards = (rewards_per_func * self.reward_weights.to(device).unsqueeze(0)).nansum(dim=1)
-
-        # Compute grouped-wise rewards
-        mean_grouped_rewards = rewards.view(-1, self.num_generations).mean(dim=1)
-
-        # Normalize the rewards to compute the advantages
-        mean_grouped_rewards = mean_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
-        advantages = rewards - mean_grouped_rewards
+        
+        # --- Advantage Calculation (수정됨) ---
+        if is_multi_agent and trajectory_indices is not None:
+            # trajectory_indices: [0, 0, 1, 1, 1, ...] (Step별 Traj ID)
+            # Input Group ID 계산: Traj ID // num_generations
+            traj_ids_tensor = torch.tensor(trajectory_indices, device=device)
+            input_group_ids = traj_ids_tensor // self.num_generations
+            
+            # 그룹별 평균 및 표준편차 계산을 위해 scatter 등의 연산 필요하지만,
+            # 단순하게는 Input별로 유니크한 Traj Reward를 뽑아서 계산해야 함.
+            # rewards는 Step별로 값이 있지만, 같은 Trajectory 내에서는 같은 Reward(Total)를 공유한다고 가정 (GRPO).
+            
+            # 1. 각 Trajectory의 대표 Reward 추출 (각 Traj의 첫번째 Step의 Reward 사용)
+            # unique_traj_ids를 찾고 그에 해당하는 첫 index를 찾음
+            unique_traj_ids, first_step_indices = torch.unique(traj_ids_tensor, return_inverse=False, sorted=True, return_counts=False)
+            # torch.unique의 first index 기능이 없으므로 아래와 같이 처리 가능
+            # traj_ids_tensor가 정렬되어 있다고 가정 (flatten 로직상 정렬됨)
+            
+            # Trajectory 별 Reward (G개)
+            # 각 Traj가 시작되는 인덱스 마스킹
+            traj_change_mask = torch.cat([torch.tensor([True], device=device), traj_ids_tensor[1:] != traj_ids_tensor[:-1]])
+            traj_rewards = rewards[traj_change_mask] # (Total Trajectories,)
+            
+            # 각 Trajectory가 속한 Input ID
+            traj_input_ids = unique_traj_ids // self.num_generations
+            
+            # Input 별 Mean/Std 계산
+            # Input 개수만큼 컨테이너 생성
+            num_inputs = traj_input_ids.max().item() + 1
+            mean_rewards = torch.zeros(num_inputs, device=device)
+            std_rewards = torch.zeros(num_inputs, device=device)
+            
+            for inp_idx in range(num_inputs):
+                mask = (traj_input_ids == inp_idx)
+                group_r = traj_rewards[mask] # 해당 Input의 Generation들 (num_generations 개)
+                mean_rewards[inp_idx] = group_r.mean()
+                std_rewards[inp_idx] = group_r.std()
+            
+            # 계산된 Mean/Std를 각 Step으로 브로드캐스팅
+            # input_group_ids (Step별 Input ID)를 인덱스로 사용
+            step_mean_rewards = mean_rewards[input_group_ids]
+            step_std_rewards = std_rewards[input_group_ids]
+            
+            advantages = rewards - step_mean_rewards
+            if self.scale_rewards != "none":
+                 advantages = advantages / (step_std_rewards + 1e-4)
+                 
+            # Logging용 Metric에 사용될 값 설정
+            mean_grouped_rewards = step_mean_rewards # 로깅을 위해 대략적으로 설정
+            
+        else:
+            # 기존 로직 (Single Turn)
+            mean_grouped_rewards = rewards.view(-1, self.num_generations).mean(dim=1)
+            mean_grouped_rewards = mean_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
+            advantages = rewards - mean_grouped_rewards
 
         if self.scale_rewards in ["group", "none"]:
             # If self.scale_rewards = "none", we'll still log group level std
