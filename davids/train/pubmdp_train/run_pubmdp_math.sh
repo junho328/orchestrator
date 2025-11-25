@@ -31,16 +31,15 @@ SEED=${SEED:-42}
 GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-0.6}
 
 # Multi-Agent Config
-NUM_AGENTS=${NUM_AGENTS:-4}
-NUM_FEW_SHOT_EXAMPLES=${NUM_FEW_SHOT_EXAMPLES:-3}
+NUM_AGENTS=${NUM_AGENTS:-3}
 
 # Quantization: optional, set --load_in_4bit or --load_in_8bit if needed
 # LOAD_IN_4BIT=${LOAD_IN_4BIT:-""}
 # LOAD_IN_8BIT=${LOAD_IN_8BIT:-""}
 
 WANDB_ENTITY=${WANDB_ENTITY:-"lamas-aipr"}
-WANDB_PROJECT=${WANDB_PROJECT:-"multi-math-train"}
-WANDB_RUN_NAME=${WANDB_RUN_NAME:-"qwen-3b-math-grpo-g16"}
+WANDB_PROJECT=${WANDB_PROJECT:-"pubmdp-math-train"}
+WANDB_RUN_NAME=${WANDB_RUN_NAME:-"qwen-3b-math-grpo-g8"}
 
 # Export environment variables so they're available to the Python script
 export WANDB_ENTITY
@@ -55,7 +54,7 @@ cd "$ORCHESTRATOR_DIR"
 # Run training with accelerate
 accelerate launch \
     --config_file "$ACCELERATE_CONFIG" \
-    -m davids.train.multi_train.multi_math_train \
+    -m davids.train.pubmdp_train.pubmdp_math_train \
     --model_name_or_path "$MODEL_NAME" \
     --dataset_name "$DATASET_NAME" \
     --output_dir "$OUTPUT_DIR" \
@@ -84,6 +83,5 @@ accelerate launch \
     --vllm_mode colocate \
     --vllm_gpu_memory_utilization "$GPU_MEMORY_UTILIZATION" \
     --num_agents "$NUM_AGENTS" \
-    --num_few_shot_examples "$NUM_FEW_SHOT_EXAMPLES" \
     "$@"
 
