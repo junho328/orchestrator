@@ -5,10 +5,9 @@ from typing import Optional, List, Dict
 
 import torch
 from datasets import load_dataset
-from transformers import AutoModelForCausalLM
-from peft import get_peft_model
 
 from trl import (
+    GRPOConfig,
     ModelConfig,
     ScriptArguments,
     TrlParser,
@@ -16,24 +15,23 @@ from trl import (
     get_peft_config,
     get_quantization_config,
 )
-from davids.train.pubmdp_train.grpo_config import GRPOConfig
-from davids.train.pubmdp_train.pubmdp_grpo_trainer import PuBMDPGRPOTrainer
-from davids.train.utils.pubmdp_prompt import get_master_orchestrator_prompt
 
+from davids.train.pubmdp_train.pubmdp_grpo_trainer import PUBMDPGRPOTrainer
+from davids.train.utils.pubmdp_prompt import get_orchestrator_prompt
 from davids.reward_utils.think_answer_format_reward import think_answer_format_reward
 from davids.reward_utils.math_reward import accuracy_reward
 
 @dataclass
-class PubMDPGRPOConfig(GRPOConfig):
+class MultiGRPOConfig(GRPOConfig):
     """Custom script arguments extending TRL's ScriptArguments."""
 
     num_agents: int = field(
-        default=4,
+        default=3,
         metadata={"help": "Number of agents"},
     )
 
 if __name__ == "__main__":
-    parser = TrlParser((ScriptArguments, PubMDPGRPOConfig, ModelConfig))
+    parser = TrlParser((ScriptArguments, MultiGRPOConfig, ModelConfig))
     script_args, training_args, model_args = parser.parse_args_and_config()
     
     # Get environment variables (set in run_single_math_train.sh)
@@ -75,20 +73,24 @@ if __name__ == "__main__":
     ################
     
     train_dataset = load_dataset(script_args.dataset_name, split="train")
+    train_dataset = train_dataset.filter(lambda x: x["level"] in ("Level 3", "Level 4", "Level 5"))
+    train_dataset = train_dataset.shuffle(seed=42)
     eval_dataset = load_dataset(script_args.dataset_name, split="test")
+    eval_dataset = eval_dataset.filter(lambda x: x["level"] in ("Level 3", "Level 4", "Level 5"))
+    eval_dataset = eval_dataset.shuffle(seed=42)
     
-    PUBMDP_MASTER_ORCHESTRATOR_SYSTEM_PROMPT = """You are a helpful assistant that solve complex math problems."""
+    ORCHESTRATOR_SYSTEM_PROMPT = "You are a helpful assistant that decompose the problem into multiple sub-problems and solve them one by one."
     
     def make_conversation(example):
         """Create conversation format for orchestrator."""
-        user_prompt = get_master_orchestrator_prompt(
+        user_prompt = get_orchestrator_prompt(
             original_problem=example["problem"], 
             previous_outputs=[],
             num_agents=training_args.num_agents, 
         )
         return {
             "prompt": [
-                {"role": "system", "content": PUBMDP_MASTER_ORCHESTRATOR_SYSTEM_PROMPT},
+                {"role": "system", "content": ORCHESTRATOR_SYSTEM_PROMPT},
                 {"role": "user", "content": user_prompt},
             ],
             "solution": example["answer"],
@@ -99,25 +101,10 @@ if __name__ == "__main__":
     eval_dataset = eval_dataset.map(make_conversation)
 
     ################
-    # Model Setup with Adapters
-    ################
-    model = AutoModelForCausalLM.from_pretrained(
-        model_args.model_name_or_path,
-        **training_args.model_init_kwargs
-    )
-
-    if peft_config is not None:
-        model = get_peft_model(model, peft_config, adapter_name="orchestrator")
-        # Add worker adapter on top (using same config structure as requested)
-        model.add_adapter("worker", peft_config)
-        # Set orchestrator as default active adapter
-        model.set_adapter("orchestrator")
-
-    ################
     # Training
     ################
-    trainer = PuBMDPGRPOTrainer(
-        model=model,
+    trainer = PUBMDPGRPOTrainer(
+        model=model_args.model_name_or_path,
         args=training_args,
         reward_funcs=[think_answer_format_reward, accuracy_reward],
         train_dataset=train_dataset,

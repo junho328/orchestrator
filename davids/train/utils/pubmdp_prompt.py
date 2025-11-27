@@ -1,10 +1,10 @@
 """Few-shot examples for orchestrator prompts."""
 import ast
 import re
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple, Optional, Union
 import random
 
-MASTER_ORCHESTRATOR_PROMPT ="""You are the **Master Orchestrator** of a finite multi-agent system.
+ORCHESTRATOR_PROMPT ="""You are the **Orchestrator** of a finite multi-agent system.
 Your goal is to solve the `Original Problem` efficiently, utilizing the insights and data provided in the `History of Previous Outputs`, while strictly adhering to the `Remaining Agent Turns`.
 
 **Your Inputs:**
@@ -40,8 +40,8 @@ Provide the Subtask and Instruction in a clear, natural narrative. Focus on the 
 {num_agents}
 """
 
-WORKER_PROMPT = """You are an **Expert Worker Agent** in a multi-agent problem-solving system.
-Your goal is to execute a specific subtask assigned by the Master Orchestrator to contribute towards solving the `Original Problem`.
+WORKER_PROMPT = """You are an **Worker Agent** in a multi-agent problem-solving system.
+Your goal is to execute a specific subtask assigned by the Orchestrator to contribute towards solving the `Original Problem`.
 
 **Your Inputs:**
 1. **Original Problem:** The ultimate context and goal of the user.
@@ -72,17 +72,28 @@ You must strictly follow this format. Do not output anything outside of these ta
 {orchestrator_instruction}
 """
 
-def get_master_orchestrator_prompt(original_problem: str, previous_outputs: list[str], num_agents: int) -> str:
+def get_orchestrator_prompt(original_problem: str, previous_outputs: Union[str, list[str]], num_agents: int) -> str:
     """
     Get orchestrator prompt formatted for the prompt.
     
     Args:
-        instruction: The user question/problem
-        num_agents: Number of agents
-        num_few_shot_examples: Number of few-shot examples
+        original_problem: The user question/problem
+        previous_outputs: List of previous agent outputs or formatted string
+        num_agents: Number of remaining agents
         
     Returns:
         Formatted string with orchestrator prompt
     """
+    # Format previous_outputs if it's a list
+    if isinstance(previous_outputs, list):
+        if previous_outputs:
+            previous_outputs_str = "\n\n".join([
+                f"Agent {i+1} Output:\n{output}" 
+                for i, output in enumerate(previous_outputs)
+            ])
+        else:
+            previous_outputs_str = "No previous outputs yet."
+    else:
+        previous_outputs_str = previous_outputs
 
-    return MASTER_ORCHESTRATOR_PROMPT.format(original_problem=original_problem, previous_outputs=previous_outputs, num_agents=num_agents)
+    return ORCHESTRATOR_PROMPT.format(original_problem=original_problem, previous_outputs=previous_outputs_str, num_agents=num_agents)
