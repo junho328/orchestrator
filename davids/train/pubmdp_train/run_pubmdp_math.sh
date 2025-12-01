@@ -3,7 +3,7 @@
 
 # Set tokenizers parallelism to avoid warnings
 export TOKENIZERS_PARALLELISM=false
-export CUDA_VISIBLE_DEVICES=1,2
+export CUDA_VISIBLE_DEVICES=0,1
 
 # Get the directory of this script
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -17,23 +17,23 @@ LEARNING_RATE=${LEARNING_RATE:-1e-6}
 DTYPE=${DTYPE:-"bfloat16"}
 NUM_TRAIN_EPOCHS=${NUM_TRAIN_EPOCHS:-1}
 EVAL_STRATEGY=${EVAL_STRATEGY:-"no"}
-MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-512}
+MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-1024}
 MAX_COMPLETION_LENGTH=${MAX_COMPLETION_LENGTH:-512}
-BATCH_SIZE=${BATCH_SIZE:-8}
+BATCH_SIZE=${BATCH_SIZE:-4}
 GRADIENT_ACCUMULATION_STEPS=${GRADIENT_ACCUMULATION_STEPS:-4}
-GRADIENT_CHECKPOINTING=${GRADIENT_CHECKPOINTING:-True}
+GRADIENT_CHECKPOINTING=${GRADIENT_CHECKPOINTING:-False}
 STEPS_PER_GENERATION=${STEPS_PER_GENERATION:-1}
-NUM_GENERATIONS=${NUM_GENERATIONS:-8}
+NUM_GENERATIONS=${NUM_GENERATIONS:-4}
 BETA=${BETA:-0.0}
 LORA_R=${LORA_R:-16}
 LORA_ALPHA=${LORA_ALPHA:-32}
 LORA_DROPOUT=${LORA_DROPOUT:-0.0}
 LORA_TARGET_MODULES=${LORA_TARGET_MODULES:-"all-linear"}
 SEED=${SEED:-42}
-GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-0.4}
+GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-0.3}
 
 # Multi-Agent Config
-NUM_AGENTS=${NUM_AGENTS:-3}
+NUM_AGENTS=${NUM_AGENTS:-2}
 
 # Quantization: optional, set --load_in_4bit or --load_in_8bit if needed
 # LOAD_IN_4BIT=${LOAD_IN_4BIT:-""}
@@ -41,7 +41,7 @@ NUM_AGENTS=${NUM_AGENTS:-3}
 
 WANDB_ENTITY=${WANDB_ENTITY:-"lamas-aipr"}
 WANDB_PROJECT=${WANDB_PROJECT:-"pubmdp-math-train"}
-WANDB_RUN_NAME=${WANDB_RUN_NAME:-"qwen-3b-math-grpo-g8"}
+WANDB_RUN_NAME=${WANDB_RUN_NAME:-"qwen-1.5b-math-grpo-g8"}
 
 # Export environment variables so they're available to the Python script
 export WANDB_ENTITY
@@ -82,9 +82,9 @@ accelerate launch \
     --log_completions \
     --seed "$SEED" \
     --gradient_checkpointing "$GRADIENT_CHECKPOINTING" \
+    --num_agents "$NUM_AGENTS" \
     --use_vllm \
     --vllm_mode colocate \
     --vllm_gpu_memory_utilization "$GPU_MEMORY_UTILIZATION" \
-    --num_agents "$NUM_AGENTS" \
     "$@"
 

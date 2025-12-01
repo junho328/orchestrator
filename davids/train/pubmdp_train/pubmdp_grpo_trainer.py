@@ -214,10 +214,14 @@ class PUBMDPGRPOTrainer(BaseTrainer):
                 )
             # Disable caching if gradient checkpointing is enabled (not supported)
             config = AutoConfig.from_pretrained(model_id)
+            if args.gradient_checkpointing:
+                config.use_cache = False
             architecture = getattr(transformers, config.architectures[0])
-            model = architecture.from_pretrained(model_id, **model_init_kwargs)
+            model = architecture.from_pretrained(model_id, config=config, **model_init_kwargs)
         else:
             model_id = model.config._name_or_path
+            if args.gradient_checkpointing:
+                model.config.use_cache = False
             if args.model_init_kwargs is not None:
                 logger.warning(
                     "You passed `model_init_kwargs` to the `GRPOConfig`, but your model is already instantiated. "
@@ -231,6 +235,10 @@ class PUBMDPGRPOTrainer(BaseTrainer):
             if not hasattr(model, "get_base_model")
             else inspect.signature(model.get_base_model().forward).parameters.keys()
         )
+
+        # Enable gradient checkpointing if requested
+        if args.gradient_checkpointing:
+            model.gradient_checkpointing_enable(gradient_checkpointing_kwargs=args.gradient_checkpointing_kwargs)
 
         if peft_config is not None or (is_peft_available() and isinstance(model, PeftModel)):
             model = prepare_peft_model(model, peft_config, args)
@@ -1040,19 +1048,29 @@ class PUBMDPGRPOTrainer(BaseTrainer):
                 
                 # last_agent_answers는 [Traj0_Ans, Traj1_Ans, ...] 형태 (Total Trajectories 개수)
                 # accuracy_reward는 completions와 solution을 받음
-                acc_completions = [ans for ans in last_agent_answers]
+                # completions는 list[list[dict[str, str]]] 형태여야 함: [[{"role": "assistant", "content": "..."}], ...]
+                acc_completions = [[{"role": "assistant", "content": ans}] for ans in last_agent_answers]
                 
                 # solution은 inputs에서 가져와야 함. trajectory_indices를 사용해 매핑
                 num_trajectories = len(last_agent_answers)
                 solutions = []
                 for traj_idx in range(num_trajectories):
                     input_idx = traj_idx // self.num_generations
-                    solutions.append(inputs[input_idx]["solution"])
+                    # solution이 문자열인지 딕셔너리인지 확인
+                    sol = inputs[input_idx].get("solution")
+                    if isinstance(sol, dict):
+                        # 딕셔너리인 경우 적절히 처리 (예: "solution" 키가 있으면 그 값을 사용)
+                        sol = sol.get("solution", str(sol))
+                    elif not isinstance(sol, str):
+                        # 문자열이 아닌 경우 문자열로 변환
+                        sol = str(sol) if sol is not None else ""
+                    solutions.append(sol)
                 
                 # Accuracy 계산 (Total Trajectories 개수만큼 결과 나옴)
                 try:
                     # Exclude 'solution' from kwargs to avoid duplicate argument error
                     filtered_kwargs = {k: v for k, v in reward_kwargs.items() if k not in ["trainer_state", "solution"]}
+                    # solution을 리스트로 전달 (reward_func가 리스트를 받도록)
                     output_reward_func = reward_func(
                         completions=acc_completions, 
                         solution=solutions,
@@ -1916,8 +1934,25 @@ class PUBMDPGRPOTrainer(BaseTrainer):
         rewards = (rewards_per_func * self.reward_weights.to(device).unsqueeze(0)).nansum(dim=1)
         
         # --- Advantage Calculation (수정됨) ---
+        # Multi-agent의 경우, rewards는 이미 gather되어 전역 크기입니다.
+        # 하지만 trajectory_indices는 로컬 프로세스의 것만 있습니다.
+        # 따라서 먼저 로컬 프로세스의 rewards를 slice해야 합니다.
         if is_multi_agent and trajectory_indices is not None:
-            # trajectory_indices: [0, 0, 1, 1, 1, ...] (Step별 Traj ID)
+            # 먼저 로컬 프로세스의 rewards를 slice
+            if self.accelerator.num_processes == 1:
+                local_process_slice = slice(0, len(completion_ids_list))
+            else:
+                # Multi-process: Gather the number of steps from all processes to calculate offsets
+                local_count = torch.tensor([len(completion_ids_list)], device=device)
+                all_counts = self.accelerator.gather(local_count)
+                start_idx = all_counts[:self.accelerator.process_index].sum().item()
+                end_idx = start_idx + len(completion_ids_list)
+                local_process_slice = slice(start_idx, end_idx)
+            
+            # 로컬 프로세스의 rewards만 사용
+            local_rewards = rewards[local_process_slice]
+            
+            # trajectory_indices: [0, 0, 1, 1, 1, ...] (Step별 Traj ID, 로컬 프로세스)
             # Input Group ID 계산: Traj ID // num_generations
             traj_ids_tensor = torch.tensor(trajectory_indices, device=device)
             input_group_ids = traj_ids_tensor // self.num_generations
@@ -1934,7 +1969,7 @@ class PUBMDPGRPOTrainer(BaseTrainer):
             # Trajectory 별 Reward (G개)
             # 각 Traj가 시작되는 인덱스 마스킹
             traj_change_mask = torch.cat([torch.tensor([True], device=device), traj_ids_tensor[1:] != traj_ids_tensor[:-1]])
-            traj_rewards = rewards[traj_change_mask] # (Total Trajectories,)
+            traj_rewards = local_rewards[traj_change_mask] # (Total Trajectories in local process,)
             
             # 각 Trajectory가 속한 Input ID
             traj_input_ids = unique_traj_ids // self.num_generations
@@ -1956,7 +1991,8 @@ class PUBMDPGRPOTrainer(BaseTrainer):
             step_mean_rewards = mean_rewards[input_group_ids]
             step_std_rewards = std_rewards[input_group_ids]
             
-            advantages = rewards - step_mean_rewards
+            # 로컬 rewards를 사용하여 advantages 계산
+            advantages = local_rewards - step_mean_rewards
             
             # Set std_rewards for logging/downstream use (and to prevent overwrite in standard block)
             std_rewards = step_std_rewards
@@ -1966,6 +2002,9 @@ class PUBMDPGRPOTrainer(BaseTrainer):
                  
             # Logging용 Metric에 사용될 값 설정
             mean_grouped_rewards = step_mean_rewards # 로깅을 위해 대략적으로 설정
+            
+            # 전역 rewards를 로컬 rewards로 교체 (나중에 process_slice에서 다시 slice할 필요 없음)
+            rewards = local_rewards
             
         else:
             # 기존 로직 (Single Turn)
@@ -1992,28 +2031,17 @@ class PUBMDPGRPOTrainer(BaseTrainer):
 
         # Slice to keep only the local part of the data
         if is_multi_agent:
-             # In multi-agent, we need to slice based on the actual number of steps generated locally.
-             # Note: This logic assumes rewards were gathered globally (concatenated) if num_processes > 1.
-             # We need to identify the start and end index for this process.
-             if self.accelerator.num_processes == 1:
-                 process_slice = slice(0, len(completion_ids_list))
-             else:
-                 # Multi-process: Gather the number of steps from all processes to calculate offsets
-                 local_count = torch.tensor([len(completion_ids_list)], device=device)
-                 # gather uses concatenation, so we get tensor of size [num_processes]
-                 all_counts = self.accelerator.gather(local_count)
-                 
-                 # Identify start index
-                 start_idx = all_counts[:self.accelerator.process_index].sum().item()
-                 end_idx = start_idx + len(completion_ids_list)
-                 process_slice = slice(start_idx, end_idx)
+             # Multi-agent의 경우, 이미 로컬 rewards로 계산했으므로 추가 slice 불필요
+             # 하지만 advantages는 이미 로컬 크기이므로 그대로 사용
+             process_slice = slice(None)  # 전체 사용
+             all_process_advantages = advantages.clone()  # 로컬 advantages를 복사
         else:
             process_slice = slice(
                 self.accelerator.process_index * len(prompts),
                 (self.accelerator.process_index + 1) * len(prompts),
             )
-        all_process_advantages = advantages.clone()  # keep the aggregated advantages for logging
-        advantages = advantages[process_slice]
+            all_process_advantages = advantages.clone()  # keep the aggregated advantages for logging
+            advantages = advantages[process_slice]
 
         # Calculate mean reward per function, but only for samples where the function was applied (non-NaN values)
         for i, reward_func_name in enumerate(self.reward_func_names):
