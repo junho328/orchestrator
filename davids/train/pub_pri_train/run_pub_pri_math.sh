@@ -4,7 +4,7 @@
 # Set tokenizers parallelism to avoid warnings
 export TOKENIZERS_PARALLELISM=false
 export TRITON_CACHE_DIR="/ext_hdd/jhna/.triton"
-# export CUDA_VISIBLE_DEVICES=1,2
+export CUDA_VISIBLE_DEVICES=1
 
 # Get the directory of this script
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -62,9 +62,42 @@ ACCELERATE_CONFIG=${ACCELERATE_CONFIG:-"/home/jhna/orchestrator/davids/configs/d
 cd "$ORCHESTRATOR_DIR"
 
 # Run training with accelerate
-accelerate launch \
-    --config_file "$ACCELERATE_CONFIG"\
-    -m davids.train.pub_pri_train.pub_pri_math_train \
+# accelerate launch \
+#     --config_file "$ACCELERATE_CONFIG"\
+#     -m davids.train.pub_pri_train.pub_pri_math_train \
+#     --model_name_or_path "$MODEL_NAME" \
+#     --dataset_name "$DATASET_NAME" \
+#     --output_dir "$OUTPUT_DIR" \
+#     --learning_rate "$LEARNING_RATE" \
+#     --top_p "$TOP_P" \
+#     --temperature "$TEMPERATURE" \
+#     --dtype "$DTYPE" \
+#     --num_train_epochs "$NUM_TRAIN_EPOCHS" \
+#     --eval_strategy "$EVAL_STRATEGY" \
+#     --max_prompt_length "$MAX_PROMPT_LENGTH" \
+#     --max_completion_length "$MAX_COMPLETION_LENGTH" \
+#     --per_device_train_batch_size "$BATCH_SIZE" \
+#     --gradient_accumulation_steps "$GRADIENT_ACCUMULATION_STEPS" \
+#     --num_generations "$NUM_GENERATIONS" \
+#     --beta "$BETA" \
+#     --loss_type dr_grpo \
+#     --use_peft \
+#     --project "$WANDB_PROJECT" \
+#     --run_name "$WANDB_RUN_NAME" \
+#     --report_to wandb \
+#     --log_completions \
+#     --seed "$SEED" \
+#     --gradient_checkpointing "$GRADIENT_CHECKPOINTING" \
+#     --num_agents "$NUM_AGENTS" \
+#     --public_agent_max_completion_length "$PUBLIC_AGENT_MAX_COMPLETION_LENGTH" \
+#     --private_agent_max_completion_length "$PRIVATE_AGENT_MAX_COMPLETION_LENGTH" \
+#     --use_liger_loss "$USE_LIGER_LOSS" \
+#     --use_vllm \
+#     --vllm_mode colocate \
+#     --vllm_gpu_memory_utilization "$GPU_MEMORY_UTILIZATION" \
+
+
+python -m davids.train.pub_pri_train.pub_pri_math_train \
     --model_name_or_path "$MODEL_NAME" \
     --dataset_name "$DATASET_NAME" \
     --output_dir "$OUTPUT_DIR" \
@@ -92,7 +125,7 @@ accelerate launch \
     --public_agent_max_completion_length "$PUBLIC_AGENT_MAX_COMPLETION_LENGTH" \
     --private_agent_max_completion_length "$PRIVATE_AGENT_MAX_COMPLETION_LENGTH" \
     --use_liger_loss "$USE_LIGER_LOSS" \
-    # --use_vllm \
-    # --vllm_mode colocate \
-    # --vllm_gpu_memory_utilization "$GPU_MEMORY_UTILIZATION" \
+    --use_vllm \
+    --vllm_mode colocate \
+    --vllm_gpu_memory_utilization "$GPU_MEMORY_UTILIZATION" \
 

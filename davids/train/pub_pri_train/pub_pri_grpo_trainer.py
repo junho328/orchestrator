@@ -493,6 +493,9 @@ class PUBPRIGRPOTrainer(BaseTrainer):
                 generation_kwargs.update(args.generation_kwargs)
             self.generation_config = GenerationConfig(**generation_kwargs)
 
+        # Track last synced adapter for vLLM so we can resync when switching (public/private)
+        self._last_loaded_adapter = None
+
         # Gradient accumulation requires scaled loss. Normally, loss scaling in the parent class depends on whether the
         # model accepts loss-related kwargs. Since we compute our own loss, this check is irrelevant. We set
         # self.model_accepts_loss_kwargs to False to enable scaling.
@@ -794,7 +797,7 @@ class PUBPRIGRPOTrainer(BaseTrainer):
                 llm_model.load_weights([(name, param)])
 
     @profiling_decorator
-    def _move_model_to_vllm(self):
+    def _move_model_to_vllm(self, force: bool = False):
         # For DeepSpeed ZeRO-3 and FSDP, we need to gather all parameters before operations
         deepspeed_plugin = self.accelerator.state.deepspeed_plugin
         zero_stage_3 = deepspeed_plugin is not None and deepspeed_plugin.zero_stage == 3
@@ -870,6 +873,10 @@ class PUBPRIGRPOTrainer(BaseTrainer):
         elif self.vllm_mode == "colocate":
             self.llm.reset_prefix_cache()
 
+        # Remember which adapter was used for this sync (active_adapter exists on PeftModel)
+        if is_peft_model(self.model):
+            self._last_loaded_adapter = self.model.active_adapter
+
     @profiling_decorator
     def _prepare_inputs(
         self, generation_batch: dict[str, Union[torch.Tensor, Any]]
@@ -891,10 +898,14 @@ class PUBPRIGRPOTrainer(BaseTrainer):
         
         if self.accelerator.is_main_process and self._step == 0:
             logger.info(f"_prepare_inputs called for the first time (mode={mode})")
-            logger.info(f"Generation batch keys: {list(generation_batch.keys())}")
-            if "prompt" in generation_batch or "problem" in generation_batch:
-                batch_size = len(generation_batch.get("prompt", generation_batch.get("problem", [])))
-                logger.info(f"Batch size: {batch_size}")
+            if isinstance(generation_batch, dict):
+                logger.info(f"Generation batch keys: {list(generation_batch.keys())}")
+                if "prompt" in generation_batch or "problem" in generation_batch:
+                    batch_size = len(generation_batch.get("prompt", generation_batch.get("problem", [])))
+                    logger.info(f"Batch size: {batch_size}")
+            else:
+                # Fallback for list/other iterables
+                logger.info(f"Generation batch type: {type(generation_batch).__name__}, len={len(generation_batch) if hasattr(generation_batch, '__len__') else 'unknown'}")
         
         if mode == "train":
             generate_every = self.args.steps_per_generation * self.num_iterations
@@ -1086,9 +1097,11 @@ class PUBPRIGRPOTrainer(BaseTrainer):
                 torch.cuda.empty_cache()  # required to avoid OOM in some cases
                 self.llm.wake_up()
 
-            # First, update the vLLM weights if needed
-            if self.state.global_step != self._last_loaded_step:
-                self._move_model_to_vllm()
+            # First, update the vLLM weights if needed (also when adapter changes)
+            active_adapter = self.model.active_adapter if is_peft_model(self.model) else None
+            need_resync = self.state.global_step != self._last_loaded_step or active_adapter != self._last_loaded_adapter
+            if need_resync:
+                self._move_model_to_vllm(force=True)
                 self._last_loaded_step = self.state.global_step
 
             # Generate completions using vLLM: gather all prompts and use them in a single call in the main process
