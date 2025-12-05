@@ -1,7 +1,7 @@
 torch==2.6.0
 transformers==4.57.1
 trl[vllm]
-deepspeed=0.17.0
+deepspeed==0.17.0
 accelerate
 peft
 bitsandbytes
