@@ -4,7 +4,10 @@ import re
 from typing import List, Dict, Tuple, Optional, Union
 import random
 
-ORCHESTRATOR_PROMPT ="""You are the **Orchestrator** of a finite multi-agent system.
+PUBLIC_SYSTEM_PROMPT = """You are a helpful assistant that decomposes the problem into multiple sub-problems."""
+PRIVATE_SYSTEM_PROMPT = """You are a helpful assistant that solves the sub-problem."""
+
+PUBLIC_PROMPT ="""You are the **Orchestrator** of a finite multi-agent system.
 Your goal is to solve the `Original Problem` efficiently, utilizing the insights and data provided in the `History of Previous Outputs`, while strictly adhering to the `Remaining Agent Turns`.
 
 **Your Inputs:**
@@ -40,7 +43,7 @@ Provide the Subtask and Instruction in a clear, natural narrative. Focus on the 
 {num_agents}
 """
 
-WORKER_PROMPT = """You are an **Worker Agent** in a multi-agent problem-solving system.
+PRIVATE_PROMPT = """You are an **Worker Agent** in a multi-agent problem-solving system.
 Your goal is to execute a specific subtask assigned by the Orchestrator to contribute towards solving the `Original Problem`.
 
 **Your Inputs:**
