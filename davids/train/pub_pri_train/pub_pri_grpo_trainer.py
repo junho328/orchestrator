@@ -8,9 +8,6 @@ from functools import partial
 from pathlib import Path
 from typing import Any, Callable, Optional, Union, List
 
-import datasets
-import torch
-import torch.utils.data
 import transformers
 from accelerate import logging
 from accelerate.utils import broadcast_object_list, gather, gather_object, is_peft_model, set_seed
@@ -36,6 +33,16 @@ from transformers.utils import is_datasets_available, is_flash_attn_2_available,
 from trl.data_utils import apply_chat_template, is_conversational, maybe_apply_chat_template, prepare_multimodal_messages
 from trl.extras.profiling import profiling_context, profiling_decorator
 from trl.extras.vllm_client import VLLMClient
+# Liger torch.compile guard crashes can happen if not disabled before import.
+
+# try:
+#     import torch._dynamo
+#     torch._dynamo.config.suppress_errors = True
+# except Exception:
+#     pass
+
+import torch
+
 from trl.import_utils import is_liger_kernel_available, is_vllm_available
 from trl.models import prepare_deepspeed, prepare_fsdp, prepare_peft_model, unwrap_model_for_generation
 from trl.models.utils import _ForwardRedirection
@@ -134,10 +141,14 @@ class PUBPRIGRPOTrainer(BaseTrainer):
                 )
             # Disable caching if gradient checkpointing is enabled (not supported)
             config = AutoConfig.from_pretrained(model_id)
+            if getattr(args, "gradient_checkpointing", False):
+                config.use_cache = False
             architecture = getattr(transformers, config.architectures[0])
             model = architecture.from_pretrained(model_id, **model_init_kwargs)
         else:
             model_id = model.config._name_or_path
+            if getattr(args, "gradient_checkpointing", False):
+                model.config.use_cache = False
             if args.model_init_kwargs is not None:
                 logger.warning(
                     "You passed `model_init_kwargs` to the `GRPOConfig`, but your model is already instantiated. "
@@ -165,6 +176,17 @@ class PUBPRIGRPOTrainer(BaseTrainer):
                 for name in missing:
                     model.add_adapter(name, base_cfg)
                     logger.warning(f"Missing '{name}' adapter detected; added to keep ranks in sync for DDP.")
+
+        # Enable gradient checkpointing (and required grads for PEFT) if requested
+        if getattr(args, "gradient_checkpointing", False):
+            if hasattr(model, "gradient_checkpointing_enable"):
+                model.gradient_checkpointing_enable(
+                    gradient_checkpointing_kwargs=getattr(args, "gradient_checkpointing_kwargs", None)
+                )
+            if is_peft_available() and isinstance(model, PeftModel):
+                # Ensure LoRA params require grads when using checkpointing
+                if hasattr(model, "enable_input_require_grads"):
+                    model.enable_input_require_grads()
 
         # Processing class
         if processing_class is None:
@@ -358,6 +380,8 @@ class PUBPRIGRPOTrainer(BaseTrainer):
 
         # Liger loss
         if self.use_liger_loss:
+            # Liger can trigger torch.compile/inductor issues on some shapes; disable its internal compile path.
+            os.environ.setdefault("LIGER_DISABLE_TORCH_COMPILE", "1")
             if not is_liger_kernel_available():
                 raise ImportError(
                     "Liger is required to use `liger_loss` as the GRPO loss. Run `pip install liger-kernel`."
@@ -441,6 +465,15 @@ class PUBPRIGRPOTrainer(BaseTrainer):
                     max_model_len = self.max_prompt_length + self.max_completion_length
                 else:
                     max_model_len = None
+
+                # vLLM + PEFT: to safely load merged LoRA weights, avoid bitsandbytes load/quantization
+                llm_load_format = self.args.vllm_model_impl if hasattr(self.args, "vllm_model_impl") else None
+                load_format = "bitsandbytes"
+                quantization = "bitsandbytes"
+                if is_peft_model(self.model):
+                    load_format = "auto"  # vLLM expects a string; "auto" keeps dense load
+                    quantization = None
+
                 self.llm = LLM(
                     model=model.name_or_path,
                     tensor_parallel_size=args.vllm_tensor_parallel_size,
@@ -456,8 +489,8 @@ class PUBPRIGRPOTrainer(BaseTrainer):
                     max_num_batched_tokens=4096,
                     model_impl=self.args.vllm_model_impl,
                     enable_sleep_mode=self.args.vllm_enable_sleep_mode,
-                    load_format="bitsandbytes",
-                    quantization="bitsandbytes",
+                    load_format=load_format,
+                    quantization=quantization,
                     # Important so temperature scaling/logit tweaking affects the TIS log probs
                     # logprobs_mode="processed_logprobs",
                 )
@@ -777,6 +810,9 @@ class PUBPRIGRPOTrainer(BaseTrainer):
                         continue  # skip FSDP subtrees already traversed
                     visited.add(full_name)
 
+                    if self._should_skip_vllm_param(full_name):
+                        continue
+
                     if self.vllm_mode == "server" and self.accelerator.is_main_process:
                         self.vllm_client.update_named_param(full_name, param.data)
                     elif self.vllm_mode == "colocate":
@@ -786,6 +822,8 @@ class PUBPRIGRPOTrainer(BaseTrainer):
     def _sync_fsdp2_params_to_vllm(self, module: nn.Module):
         # For FSDP2, module.state_dict() already covers all parameters, so no need for recursion
         for name, param in module.state_dict().items():
+            if self._should_skip_vllm_param(name):
+                continue
             if param.is_cpu:
                 param = param.to(torch.device("cuda"))
             param = param.full_tensor()
@@ -829,8 +867,9 @@ class PUBPRIGRPOTrainer(BaseTrainer):
                         self._sync_fsdp2_params_to_vllm(self.model)
                 else:
                     # DeepSpeed ZeRO-3 with PEFT
-                    # DeepSpeed ZeRO-3 with PEFT
                     for name, param in self.model.named_parameters():
+                        if self._should_skip_vllm_param(name):
+                            continue
                         # When using PEFT, we need to recover the original parameter name and discard some parameters
                         name = name.removeprefix("base_model.model.").replace(".base_layer", "")
                         if self.model.prefix in name:
@@ -844,7 +883,17 @@ class PUBPRIGRPOTrainer(BaseTrainer):
                             self.vllm_client.update_named_param(name, param.data)
                         elif self.vllm_mode == "colocate":
                             llm_model = self.llm.llm_engine.model_executor.driver_worker.model_runner.model
-                            llm_model.load_weights([(name, param.data)])
+                            try:
+                                llm_model.load_weights([(name, param.data)])
+                            except AssertionError as e:
+                                raise ValueError(
+                                    f"vLLM load_weights shape mismatch for param '{name}' "
+                                    f"(param={tuple(param.data.shape)}). This usually means the "
+                                    f"weight name/shape after LoRA merge does not match vLLM's "
+                                    f"backbone. Try removing adapters from the sync or verify the "
+                                    f"adapter merge output."
+                                ) from e
+
                 # Unmerge adapters while parameters are still gathered
                 self.model.unmerge_adapter()
                 # Parameters will automatically be repartitioned when exiting the context
@@ -859,13 +908,24 @@ class PUBPRIGRPOTrainer(BaseTrainer):
                     self._sync_fsdp2_params_to_vllm(self.model)
             else:
                 for name, param in self.model.named_parameters():
+                    if self._should_skip_vllm_param(name):
+                        continue
                     name = self._fix_param_name_to_vllm(name)
                     with gather_if_zero3([param]):
                         if self.vllm_mode == "server" and self.accelerator.is_main_process:
                             self.vllm_client.update_named_param(name, param.data)
                         elif self.vllm_mode == "colocate":
                             llm_model = self.llm.llm_engine.model_executor.driver_worker.model_runner.model
-                            llm_model.load_weights([(name, param.data)])
+                            try:
+                                llm_model.load_weights([(name, param.data)])
+                            except AssertionError as e:
+                                raise ValueError(
+                                    f"vLLM load_weights shape mismatch for param '{name}' "
+                                    f"(param={tuple(param.data.shape)}). This usually means the "
+                                    f"weight name/shape after LoRA merge does not match vLLM's "
+                                    f"backbone. Try removing adapters from the sync or verify the "
+                                    f"adapter merge output."
+                                ) from e
 
         # Reset cache on vLLM
         if self.vllm_mode == "server" and self.accelerator.is_main_process:
@@ -876,6 +936,16 @@ class PUBPRIGRPOTrainer(BaseTrainer):
         # Remember which adapter was used for this sync (active_adapter exists on PeftModel)
         if is_peft_model(self.model):
             self._last_loaded_adapter = self.model.active_adapter
+
+    def _should_skip_vllm_param(self, name: str) -> bool:
+        # Skip PEFT/adapter auxiliary params that vLLM backbone does not expect
+        lowered = name.lower()
+        return (
+            "lora" in lowered
+            or "adapter" in lowered
+            or "modules_to_save" in lowered
+            or "bias_finetune" in lowered
+        )
 
     @profiling_decorator
     def _prepare_inputs(
@@ -1082,6 +1152,23 @@ class PUBPRIGRPOTrainer(BaseTrainer):
                 # Regular prompt format
                 formatted = maybe_apply_chat_template({"prompt": prompt}, self.processing_class)
                 prompts_text.append(formatted.get("prompt", prompt))
+
+        if self.use_vllm:
+            # vLLM requires raw string prompts; coerce any non-string (e.g., chat messages) to string with chat template
+            coerced_prompts_text = []
+            for pt in prompts_text:
+                if isinstance(pt, str):
+                    coerced_prompts_text.append(pt)
+                else:
+                    if hasattr(self.processing_class, "apply_chat_template"):
+                        try:
+                            coerced = self.processing_class.apply_chat_template(pt, tokenize=False, add_generation_prompt=True)
+                            coerced_prompts_text.append(coerced)
+                            continue
+                        except Exception:
+                            pass
+                    coerced_prompts_text.append(str(pt))
+            prompts_text = coerced_prompts_text
 
         if images is not None:
             prompt_inputs = self.processing_class(text=prompts_text, padding=True, return_tensors="pt", **kwargs)
