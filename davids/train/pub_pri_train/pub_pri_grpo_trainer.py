@@ -15,6 +15,7 @@ from datasets import Dataset, IterableDataset
 from torch import nn
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.utils.data import DataLoader, Sampler
+from torch.utils.data.distributed import DistributedSampler
 from transformers import (
     AutoConfig,
     AutoModelForSequenceClassification,
@@ -35,11 +36,11 @@ from trl.extras.profiling import profiling_context, profiling_decorator
 from trl.extras.vllm_client import VLLMClient
 # Liger torch.compile guard crashes can happen if not disabled before import.
 
-# try:
-#     import torch._dynamo
-#     torch._dynamo.config.suppress_errors = True
-# except Exception:
-#     pass
+try:
+    import torch._dynamo
+    torch._dynamo.config.suppress_errors = True
+except Exception:
+    pass
 
 import torch
 
@@ -87,6 +88,49 @@ if is_wandb_available():
 logger = logging.get_logger(__name__)
 
 RewardFunc = Union[str, PreTrainedModel, Callable[[list, list], list[float]]]
+
+# Distributed + repeat sampler: sharded indices per rank, then repeat like RepeatSampler.
+class DistributedRepeatSampler(DistributedSampler):
+    def __init__(
+        self,
+        dataset,
+        num_replicas=None,
+        rank=None,
+        mini_repeat_count: int = 1,
+        batch_size: int = 1,
+        repeat_count: int = 1,
+        shuffle: bool = True,
+        seed: int = 0,
+        drop_last: bool = False,
+    ):
+        super().__init__(
+            dataset=dataset,
+            num_replicas=num_replicas,
+            rank=rank,
+            shuffle=shuffle,
+            seed=seed,
+            drop_last=drop_last,
+        )
+        self.mini_repeat_count = mini_repeat_count
+        self.batch_size = batch_size
+        self.repeat_count = repeat_count
+
+    def __iter__(self):
+        # base_indices are already sharded to this rank by DistributedSampler
+        base_indices = list(super().__iter__())
+        batches = [base_indices[i : i + self.batch_size] for i in range(0, len(base_indices), self.batch_size)]
+        batches = [b for b in batches if len(b) == self.batch_size]  # drop incomplete to keep shapes consistent
+
+        for batch in batches:
+            for _ in range(self.repeat_count):
+                for idx in batch:
+                    for _ in range(self.mini_repeat_count):
+                        yield idx
+
+    def __len__(self) -> int:
+        base_len = super().__len__()  # number of items for this rank (after padding)
+        full_batches = base_len // self.batch_size
+        return full_batches * self.batch_size * self.mini_repeat_count * self.repeat_count
 
 logger = logging.get_logger(__name__)
 
@@ -598,24 +642,96 @@ class PUBPRIGRPOTrainer(BaseTrainer):
         if dataset is None:
             dataset = self.train_dataset
         
-        if self.accelerator.is_main_process:
-            logger.info(f"Creating RepeatSampler: dataset_size={len(dataset) if hasattr(dataset, '__len__') else 'unknown'}, "
-                       f"mini_repeat_count={self.num_generations}, batch_size={self.args.generation_batch_size // self.num_generations}, "
-                       f"repeat_count={self.num_iterations * self.args.steps_per_generation}")
-        
-        sampler = RepeatSampler(
-            data_source=dataset,
-            mini_repeat_count=self.num_generations,
-            batch_size=self.args.generation_batch_size // self.num_generations,
-            repeat_count=self.num_iterations * self.args.steps_per_generation,
-            shuffle=self.shuffle_dataset,
-            seed=self.args.seed,
-        )
-        
-        if self.accelerator.is_main_process:
-            logger.info("RepeatSampler created successfully")
+        # Each prompt should appear once; num_generations duplication is handled inside _generate_multi_turn.
+        # We set batch_size to the number of unique prompts per local step (before steps_per_generation splitting).
+        unique_prompts_per_step = self.args.per_device_train_batch_size // self.num_generations
+        if self.args.per_device_train_batch_size % self.num_generations != 0:
+            raise ValueError(
+                f"per_device_train_batch_size ({self.args.per_device_train_batch_size}) must be divisible by "
+                f"num_generations ({self.num_generations}) so that each step has an integer number of unique prompts."
+            )
+
+        repeat_count = self.num_iterations * self.args.steps_per_generation
+
+        if self.accelerator.num_processes > 1:
+            sampler = DistributedRepeatSampler(
+                dataset=dataset,
+                num_replicas=self.accelerator.num_processes,
+                rank=self.accelerator.process_index,
+                mini_repeat_count=1,
+                batch_size=unique_prompts_per_step,
+                repeat_count=repeat_count,
+                shuffle=self.shuffle_dataset,
+                seed=self.args.seed,
+                drop_last=False,
+            )
+        else:
+            if self.accelerator.is_main_process:
+                logger.info(
+                    "Creating RepeatSampler: dataset_size=%s, mini_repeat_count=%s, batch_size=%s, repeat_count=%s",
+                    len(dataset) if hasattr(dataset, "__len__") else "unknown",
+                    1,
+                    unique_prompts_per_step,
+                    repeat_count,
+                )
+            sampler = RepeatSampler(
+                data_source=dataset,
+                mini_repeat_count=1,
+                batch_size=unique_prompts_per_step,
+                repeat_count=repeat_count,
+                shuffle=self.shuffle_dataset,
+                seed=self.args.seed,
+            )
+            if self.accelerator.is_main_process:
+                logger.info("RepeatSampler created successfully")
         
         return sampler
+
+    def get_train_dataloader(self) -> DataLoader:
+        """
+        Custom dataloader so that each local step receives
+        (per_device_train_batch_size // num_generations) unique prompts,
+        then `_prepare_inputs` duplicates them num_generations times during generation.
+        The loader batch size is multiplied by steps_per_generation so we can
+        split into that many accumulation slices without mixing prompts.
+        """
+        if self.train_dataset is None:
+            raise ValueError("Trainer: training requires a train_dataset.")
+
+        # Validate divisibility once more for clarity.
+        if self.args.per_device_train_batch_size % self.num_generations != 0:
+            raise ValueError(
+                f"per_device_train_batch_size ({self.args.per_device_train_batch_size}) must be divisible by "
+                f"num_generations ({self.num_generations})."
+            )
+
+        unique_prompts_per_step = self.args.per_device_train_batch_size // self.num_generations
+        batch_size = unique_prompts_per_step * self.args.steps_per_generation
+
+        # Build dataloader params (mirrors transformers.Trainer with our custom batch_size/sampler).
+        data_collator = self.data_collator
+        dataloader_params = {
+            "batch_size": batch_size,
+            "collate_fn": data_collator,
+            "num_workers": self.args.dataloader_num_workers,
+            "pin_memory": self.args.dataloader_pin_memory,
+            "persistent_workers": self.args.dataloader_persistent_workers,
+        }
+
+        if not isinstance(self.train_dataset, torch.utils.data.IterableDataset):
+            dataloader_params["sampler"] = self._get_train_sampler()
+            dataloader_params["drop_last"] = self.args.dataloader_drop_last
+            dataloader_params["worker_init_fn"] = partial(
+                seed_worker, num_workers=self.args.dataloader_num_workers, rank=self.args.process_index
+            )
+            dataloader_params["prefetch_factor"] = self.args.dataloader_prefetch_factor
+
+        # When using DistributedRepeatSampler, the sampler already handles the distributed nature
+        # of the dataset (splitting indices per rank). If we pass this DataLoader to accelerator.prepare(),
+        # Accelerate might attempt to shard it again (depending on version/detection), leading to
+        # double sharding (e.g., using only 1/4 of data with 2 GPUs).
+        # Since the inputs are text/metadata (not yet tensors on device), we can skip prepare().
+        return DataLoader(self.train_dataset, **dataloader_params)
 
     def _get_eval_sampler(self, eval_dataset) -> Sampler:
         # See _get_train_sampler for an explanation of the sampler.

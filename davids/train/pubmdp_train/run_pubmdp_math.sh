@@ -4,6 +4,7 @@
 # Set tokenizers parallelism to avoid warnings
 export TOKENIZERS_PARALLELISM=false
 export CUDA_VISIBLE_DEVICES=0,1
+export
 
 # Get the directory of this script
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -28,9 +29,9 @@ BETA=${BETA:-0.0}
 LORA_R=${LORA_R:-16}
 LORA_ALPHA=${LORA_ALPHA:-32}
 LORA_DROPOUT=${LORA_DROPOUT:-0.0}
-LORA_TARGET_MODULES=${LORA_TARGET_MODULES:-"all-linear"}
+# LORA_TARGET_MODULES=${LORA_TARGET_MODULES:-"all-linear"}
 SEED=${SEED:-42}
-GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-0.2}
+GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-0.5}
 
 # Multi-Agent Config
 NUM_AGENTS=${NUM_AGENTS:-2}
@@ -75,7 +76,6 @@ accelerate launch \
     --lora_r "$LORA_R" \
     --lora_alpha "$LORA_ALPHA" \
     --lora_dropout "$LORA_DROPOUT" \
-    --lora_target_modules "$LORA_TARGET_MODULES" \
     --project "$WANDB_PROJECT" \
     --run_name "$WANDB_RUN_NAME" \
     --report_to wandb \
