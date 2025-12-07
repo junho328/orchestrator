@@ -2008,28 +2008,13 @@ class PUBPRIGRPOTrainer(BaseTrainer):
             
         mean_grouped_rewards_log = mean_rewards.mean().item()
 
-        # Slice to keep only the local part of the data
-        # Note: advantages now has shape (num_trajectories * num_turns,)
-        # But we need to account for distributed training
-        num_local_samples = len(prompts)
-        num_local_turns = num_local_samples * self.num_generations * self.num_turns
-        process_slice = slice(
-            self.accelerator.process_index * num_local_turns,
-            (self.accelerator.process_index + 1) * num_local_turns,
-        )
-        all_process_advantages = advantages.clone()  # keep the aggregated advantages for logging
-        if len(advantages) > process_slice.stop:
-            advantages = advantages[process_slice]
-        else:
-            # If slice is out of bounds, just use what we have
-            start_idx = min(process_slice.start, len(advantages))
-            advantages = advantages[start_idx:]
-        
-        # Store turn_info for loss computation (slice to match advantages)
-        if len(turn_info) > process_slice.stop:
-            self._current_turn_info = turn_info[process_slice.start:process_slice.stop]
-        else:
-            self._current_turn_info = turn_info[start_idx:] if 'start_idx' in locals() else turn_info
+        # Advantages and turn_info are already local (derived from local prompts/generations).
+        # We need global advantages only for logging to match gathered prompts.
+        # Use gather to collect advantages from all ranks for logging consistency.
+        all_process_advantages = self.accelerator.gather(advantages)
+
+        # No slicing needed for local training data as advantages is already local
+        self._current_turn_info = turn_info
 
         # Calculate mean reward per function, but only for samples where the function was applied (non-NaN values)
         # Note: rewards_per_func is now (num_turns, 1) shape, so we need to handle it differently
