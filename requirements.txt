@@ -1,6 +1,6 @@
 torch==2.6.0
 transformers==4.57.1
-trl[vllm]
+trl
 deepspeed==0.17.0
 accelerate
 peft
@@ -19,6 +19,5 @@ py-cpuinfo
 pydantic 
 tqdm 
 nvidia-ml-py
-#vllm==0.8.5.post1
-#pip install flash_attn==2.7.4.post1 --no-build-isolation
+liger-kernel
 
