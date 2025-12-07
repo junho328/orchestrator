@@ -7,7 +7,6 @@ import torch
 from datasets import load_dataset
 
 from trl import (
-    GRPOConfig,
     ModelConfig,
     ScriptArguments,
     TrlParser,
@@ -19,6 +18,7 @@ from trl import (
 from peft import LoraConfig, get_peft_model
 from transformers import AutoModelForCausalLM
 from davids.train.pub_pri_train.pub_pri_grpo_trainer import PUBPRIGRPOTrainer
+from davids.train.pub_pri_train.grpo_config import GRPOConfig
 from davids.reward_utils.think_answer_format_reward import think_answer_format_reward
 from davids.reward_utils.math_reward import accuracy_reward
 
@@ -113,14 +113,14 @@ if __name__ == "__main__":
     train_dataset = train_dataset.filter(lambda x: x["level"] in ("Level 3", "Level 4", "Level 5"))
     print(f"Train dataset after filtering: {len(train_dataset)} samples", file=sys.stderr, flush=True)
     
-    train_dataset = train_dataset.shuffle(seed=42)
+    train_dataset = train_dataset.shuffle(seed=training_args.seed)
     print("Loading eval dataset...", file=sys.stderr, flush=True)
     
     eval_dataset = load_dataset(script_args.dataset_name, split="test")
     print(f"Eval dataset loaded: {len(eval_dataset)} samples", file=sys.stderr, flush=True)
     eval_dataset = eval_dataset.filter(lambda x: x["level"] in ("Level 3", "Level 4", "Level 5"))
     print(f"Eval dataset after filtering: {len(eval_dataset)} samples", file=sys.stderr, flush=True)
-    eval_dataset = eval_dataset.shuffle(seed=42)
+    eval_dataset = eval_dataset.shuffle(seed=training_args.seed)
     
     def filter_columns(example):
         return {"problem": example["problem"], "answer": example["answer"]}

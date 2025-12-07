@@ -349,7 +349,7 @@ class PUBPRIGRPOTrainer(BaseTrainer):
             )
 
         # Multi-step
-        self.num_iterations = args.num_iterations  # = 𝜇 in the GRPO paper
+        self.num_iterations = args.num_iterations  
         self.epsilon_low = args.epsilon
         self.epsilon_high = args.epsilon_high if args.epsilon_high is not None else args.epsilon
         # Tracks the number of iterations (forward + backward passes), including those within a grad accum cycle
@@ -364,6 +364,13 @@ class PUBPRIGRPOTrainer(BaseTrainer):
         
         self.public_agent_max_completion_length = getattr(args, 'public_agent_max_completion_length', args.max_completion_length)
         self.private_agent_max_completion_length = getattr(args, 'private_agent_max_completion_length', args.max_completion_length)
+        
+        # For Liger loss, use the maximum of all completion lengths to ensure it can handle all cases
+        self.liger_max_completion_length = max(
+            self.max_completion_length,
+            self.public_agent_max_completion_length,
+            self.private_agent_max_completion_length
+        )
 
         # The trainer estimates the number of FLOPs (floating-point operations) using the number of elements in the
         # input tensor associated with the key "input_ids". However, in GRPO, the sampled data does not include the
@@ -440,7 +447,7 @@ class PUBPRIGRPOTrainer(BaseTrainer):
                 temperature=self.temperature,
                 use_ref_model=self.beta != 0.0,
                 loss_type=self.loss_type,
-                max_completion_length=self.max_completion_length,
+                max_completion_length=self.liger_max_completion_length,
             )
 
         # Initialize the metrics
@@ -457,6 +464,7 @@ class PUBPRIGRPOTrainer(BaseTrainer):
             "rewards": defaultdict(lambda: deque(maxlen=args.generation_batch_size)),
             "advantages": deque(maxlen=args.generation_batch_size),
         }
+        self._trajectory_buffer = []
 
         # Ensure each process receives a unique seed to prevent duplicate completions when generating with
         # transformers if num_generations exceeds per_device_train_batch_size. We could skip it if we use vLLM, but
@@ -733,14 +741,103 @@ class PUBPRIGRPOTrainer(BaseTrainer):
         # Since the inputs are text/metadata (not yet tensors on device), we can skip prepare().
         return DataLoader(self.train_dataset, **dataloader_params)
 
-    def _get_eval_sampler(self, eval_dataset) -> Sampler:
-        # See _get_train_sampler for an explanation of the sampler.
-        return RepeatSampler(
-            data_source=eval_dataset,
-            mini_repeat_count=self.num_generations,
-            seed=self.args.seed,
-        )
+    def _get_eval_sampler(self, dataset: Optional[Dataset] = None) -> Sampler:
+                                
+        if dataset is None:
+            dataset = self.eval_dataset
+        
+        # Each prompt should appear once; num_generations duplication is handled inside _generate_multi_turn.
+        # We set batch_size to the number of unique prompts per local step (before steps_per_generation splitting).
+        unique_prompts_per_step = self.args.per_device_eval_batch_size // self.num_generations
+        
+        if self.args.per_device_train_batch_size % self.num_generations != 0:
+            raise ValueError(
+                f"per_device_train_batch_size ({self.args.per_device_train_batch_size}) must be divisible by "
+                f"num_generations ({self.num_generations}) so that each step has an integer number of unique prompts."
+            )
 
+        repeat_count = self.num_iterations * self.args.steps_per_generation
+
+        if self.accelerator.num_processes > 1:
+            sampler = DistributedRepeatSampler(
+                dataset=dataset,
+                num_replicas=self.accelerator.num_processes,
+                rank=self.accelerator.process_index,
+                mini_repeat_count=1,
+                batch_size=unique_prompts_per_step,
+                repeat_count=repeat_count,
+                shuffle=self.shuffle_dataset,
+                seed=self.args.seed,
+                drop_last=False,
+            )
+        else:
+            if self.accelerator.is_main_process:
+                logger.info(
+                    "Creating RepeatSampler: dataset_size=%s, mini_repeat_count=%s, batch_size=%s, repeat_count=%s",
+                    len(dataset) if hasattr(dataset, "__len__") else "unknown",
+                    1,
+                    unique_prompts_per_step,
+                    repeat_count,
+                )
+            sampler = RepeatSampler(
+                data_source=dataset,
+                mini_repeat_count=1,
+                batch_size=unique_prompts_per_step,
+                repeat_count=repeat_count,
+                shuffle=self.shuffle_dataset,
+                seed=self.args.seed,
+            )
+            if self.accelerator.is_main_process:
+                logger.info("RepeatSampler created successfully")
+        
+        return sampler
+    
+    def get_eval_dataloader(self) -> DataLoader:
+        """
+        Custom dataloader so that each local step receives
+        (per_device_train_batch_size // num_generations) unique prompts,
+        then `_prepare_inputs` duplicates them num_generations times during generation.
+        The loader batch size is multiplied by steps_per_generation so we can
+        split into that many accumulation slices without mixing prompts.
+        """
+        if self.eval_dataset is None:
+            raise ValueError("Trainer: evaluation requires a eval_dataset.")
+
+        # Validate divisibility once more for clarity.
+        if self.args.per_device_eval_batch_size % self.num_generations != 0:
+            raise ValueError(
+                f"per_device_eval_batch_size ({self.args.per_device_eval_batch_size}) must be divisible by "
+                f"num_generations ({self.num_generations})."
+            )
+
+        unique_prompts_per_step = self.args.per_device_eval_batch_size // self.num_generations
+        batch_size = unique_prompts_per_step * self.args.steps_per_generation
+
+        # Build dataloader params (mirrors transformers.Trainer with our custom batch_size/sampler).
+        data_collator = self.data_collator
+        dataloader_params = {
+            "batch_size": batch_size,
+            "collate_fn": data_collator,
+            "num_workers": self.args.dataloader_num_workers,
+            "pin_memory": self.args.dataloader_pin_memory,
+            "persistent_workers": self.args.dataloader_persistent_workers,
+        }
+
+        if not isinstance(self.eval_dataset, torch.utils.data.IterableDataset):
+            dataloader_params["sampler"] = self._get_eval_sampler()
+            dataloader_params["drop_last"] = self.args.dataloader_drop_last
+            dataloader_params["worker_init_fn"] = partial(
+                seed_worker, num_workers=self.args.dataloader_num_workers, rank=self.args.process_index
+            )
+            dataloader_params["prefetch_factor"] = self.args.dataloader_prefetch_factor
+
+        # When using DistributedRepeatSampler, the sampler already handles the distributed nature
+        # of the dataset (splitting indices per rank). If we pass this DataLoader to accelerator.prepare(),
+        # Accelerate might attempt to shard it again (depending on version/detection), leading to
+        # double sharding (e.g., using only 1/4 of data with 2 GPUs).
+        # Since the inputs are text/metadata (not yet tensors on device), we can skip prepare().
+        return DataLoader(self.eval_dataset, **dataloader_params)
+        
     @profiling_decorator
     def _get_last_hidden_state(
         self,
@@ -1115,130 +1212,96 @@ class PUBPRIGRPOTrainer(BaseTrainer):
         return inputs
 
     @profiling_decorator
-    def _calculate_trajectory_rewards(self, inputs, prompts, completions_per_trajectory, completion_ids_list, turn_info):
+    def _calculate_trajectory_rewards(self, inputs, completions_per_trajectory, *args, **kwargs):
         """
-        Calculate rewards per trajectory.
-        Accuracy (1.0): Check if LAST Private Answer == Solution.
-        Format (0.5): Check if ALL turns have <think> and <answer>.
+        Calculate per-trajectory rewards.
+
+        - Accuracy: 1.0 if the *last* turn matches the gold solution, else 0.0 (None -> 0.0)
+        - Format: 0.5 if *all* turns contain <think>...</think> and <answer>...</answer>, else 0.0
         """
         device = self.accelerator.device
         num_trajectories = len(completions_per_trajectory)
-        rewards = torch.zeros(num_trajectories, device=device)
-        
-        # Map flat input structure back to problems/solutions
-        # inputs contains the original raw data items (len = num_samples)
-        solutions = [x.get("solution", "") for x in inputs]
-        
-        for traj_idx in range(num_trajectories):
-            sample_idx = traj_idx // self.num_generations
-            solution = solutions[sample_idx]
-            trajectory_completions = completions_per_trajectory[traj_idx] # list of strings (contents)
 
-            # 1. Format Reward (Check all turns)
-            all_formatted = True
-            for content in trajectory_completions:
-                # Handle dictionary format if conversational
-                if isinstance(content, list): content = content[0]["content"]
-                
-                # Use the imported reward function logic
-                # Assuming think_answer_format_reward returns list of floats
-                fmt_score = think_answer_format_reward([[{"role": "assistant", "content": content}]])[0]
-                if fmt_score < 0.5:
-                    all_formatted = False
-                    break
-            format_reward = 0.5 if all_formatted else 0.0
+        if num_trajectories == 0:
+            empty = torch.zeros(0, device=device)
+            return empty, empty, empty
 
-            # 2. Accuracy Reward (Check last private turn)
-            # Find last private output in this trajectory
-            last_private_content = None
-            # Reconstruct turn info for this trajectory
-            # Trajectory completions are ordered by time (Turn0, Turn1...)
-            # We iterate backwards
-            for i in range(len(trajectory_completions) - 1, -1, -1):
-                # Turn info order in flattened list: [Turn0_AllSamples..., Turn1_AllSamples...]
-                # This is tricky to map directly from completions_per_trajectory list.
-                # Easier: just check the turn index logic (Even=Public, Odd=Private)
-                # Last Private turn is always index 2*num_agents - 1 or generally odd
-                if i % 2 != 0: # Odd index = Private
-                    last_private_content = trajectory_completions[i]
-                    if isinstance(last_private_content, list): last_private_content = last_private_content[0]["content"]
-                    break
-            
-            accuracy = 0.0
-            if last_private_content:
-                acc_scores = accuracy_reward(
-                    completions=[[{"role": "assistant", "content": last_private_content}]],
-                    solution=[solution]
-                )
-                accuracy = acc_scores[0] if acc_scores[0] is not None else 0.0
+        solutions = [example.get("solution", "") for example in inputs for _ in range(self.num_generations)]
 
-            rewards[traj_idx] = accuracy + format_reward
-            
-        return rewards
+        def _to_message(turn) -> list[dict[str, str]]:
+            # Normalize any turn (str | dict | list) into a single assistant message for reward functions
+            if isinstance(turn, list):
+                if turn and isinstance(turn[0], dict) and "content" in turn[0]:
+                    text = turn[0]["content"]
+                else:
+                    # Flatten any nested values into a string
+                    text = " ".join(
+                        t.get("content", "") if isinstance(t, dict) else str(t)  # type: ignore[arg-type]
+                        for t in turn
+                    )
+            elif isinstance(turn, dict) and "content" in turn:
+                text = turn["content"]
+            else:
+                text = str(turn)
+            return [{"role": "assistant", "content": text}]
+
+        # Accuracy on the last turn of each trajectory
+        acc_inputs = [_to_message(traj[-1]) for traj in completions_per_trajectory]
+        acc_scores_list = accuracy_reward(completions=acc_inputs, solution=solutions)
+        acc_scores = torch.tensor(
+            [score if score is not None else 0.0 for score in acc_scores_list],
+            dtype=torch.float32,
+            device=device,
+        )
+
+        # Format check on every turn of every trajectory
+        flat_messages = [_to_message(turn) for traj in completions_per_trajectory for turn in traj]
+        flat_fmt_scores = think_answer_format_reward(flat_messages)
+        flat_fmt_tensor = torch.tensor(flat_fmt_scores, dtype=torch.float32, device=device)
+
+        num_turns = len(completions_per_trajectory[0])
+        fmt_scores_matrix = flat_fmt_tensor.view(num_trajectories, num_turns)
+        all_formatted = (fmt_scores_matrix >= 0.5).all(dim=1)
+        format_rewards = torch.where(
+            all_formatted,
+            torch.full_like(acc_scores, 0.5),
+            torch.zeros_like(acc_scores),
+        )
+
+        rewards = acc_scores + format_rewards
+        return rewards, acc_scores, format_rewards
 
     @profiling_decorator
-    def _calculate_rewards(self, inputs, prompts, completions, completion_ids_list):
-        device = self.accelerator.device
-        
-        # 1. Trajectory별 Reward 계산
-        rewards_per_trajectory = self._calculate_trajectory_rewards(
-            inputs, prompts, completions, completion_ids_list, self._current_turn_info
+    def _calculate_rewards(self, inputs, completions_per_trajectory):
+        """
+        Compute trajectory-level rewards (accuracy + format) and log per-component stats.
+
+        Returns:
+            rewards_per_trajectory: tensor of shape (num_trajectories,)
+            acc_scores: tensor of shape (num_trajectories,)
+            format_rewards: tensor of shape (num_trajectories,)
+        """
+        rewards_per_trajectory, acc_scores, format_rewards = self._calculate_trajectory_rewards(
+            inputs=inputs, completions_per_trajectory=completions_per_trajectory
         )
-        
-        # 2. GRPO 정규화
-        num_samples = len(prompts)
-        rewards_grouped = rewards_per_trajectory.view(num_samples, self.num_generations)
-        
-        mean_rewards = rewards_grouped.mean(dim=1, keepdim=True)
-        std_rewards = rewards_grouped.std(dim=1, keepdim=True)
-        
-        if self.scale_rewards == "group":
-            advantages_grouped = (rewards_grouped - mean_rewards) / (std_rewards + 1e-4)
-        elif self.scale_rewards == "batch":
-            batch_mean = rewards_per_trajectory.mean()
-            batch_std = rewards_per_trajectory.std()
-            advantages_grouped = (rewards_grouped - batch_mean) / (batch_std + 1e-4)
-        else:
-            advantages_grouped = rewards_grouped - mean_rewards
 
-        # (Num_Trajectories,) 형태로 펼침
-        advantages_per_trajectory = advantages_grouped.view(-1)
+        gathered_rewards = gather(rewards_per_trajectory)
+        gathered_acc = gather(acc_scores)
+        gathered_format = gather(format_rewards)
 
-        # 3. 데이터 정렬 (Vectorized Operation으로 최적화)
-        # Trajectory별 점수를 턴 횟수만큼 반복
-        advantages = advantages_per_trajectory.repeat(self.num_turns)
-
-        # 4. Distributed Training 처리 (Process Slice)
-        num_local_turns = len(prompts) * self.num_generations * self.num_turns
-        process_slice = slice(
-            self.accelerator.process_index * num_local_turns,
-            (self.accelerator.process_index + 1) * num_local_turns,
-        )
-        
-        all_process_advantages = advantages.clone()
-        
-        if len(advantages) > process_slice.stop:
-            advantages = advantages[process_slice]
-        else:
-            start_idx = min(process_slice.start, len(advantages))
-            advantages = advantages[start_idx:]
-
-        # 5. Logging
         mode = "train" if self.model.training else "eval"
-        rewards_per_func = advantages.unsqueeze(1) 
+        if gathered_acc.numel() > 0:
+            self._metrics[mode]["rewards/accuracy"].append(gathered_acc.nanmean().item())
+        if gathered_format.numel() > 0:
+            self._metrics[mode]["rewards/format"].append(gathered_format.nanmean().item())
 
-        self._metrics[mode]["reward"].append(rewards_grouped.mean().item())
-        self._metrics[mode]["reward_std"].append(std_rewards.mean().item())
-        self._logs["advantages"].extend(all_process_advantages.tolist())
-        
-        # Reward 로깅 (Trajectory-Major -> Turn-Major 변환하여 기록)
-        expanded_rewards = rewards_per_trajectory.repeat(self.num_turns)
-        
-        if self.reward_func_names:
-            name = self.reward_func_names[0]
-            self._logs["rewards"][name].extend(expanded_rewards.tolist())
+        # Log each component separately for easier inspection
+        self._logs["rewards"]["accuracy"].extend(gathered_acc.tolist())
+        self._logs["rewards"]["format"].extend(gathered_format.tolist())
+        # Total reward (acc + format) for compatibility with downstream code
+        self._logs["rewards"]["total"].extend(gathered_rewards.tolist())
 
-        return rewards_per_func
+        return rewards_per_trajectory
 
     def _generate_single_turn(self, prompts: list[str], images: Optional[list], max_completion_length: Optional[int] = None):
         device = self.accelerator.device
@@ -1527,6 +1590,99 @@ class PUBPRIGRPOTrainer(BaseTrainer):
             logprobs = None  # not used in this case
 
         return prompt_ids, completion_ids, logprobs, forward_kwargs
+    
+    def _generate_multi_turn(self, prompts: list, images: Optional[list], problems: list[str], solutions: list[str]):
+        device = self.accelerator.device
+        num_samples = len(prompts)
+        
+        all_turn_prompt_ids = []
+        all_turn_completion_ids = []
+        all_turn_logprobs = []
+        turn_info = []
+        all_forward_kwargs = []
+
+        current_histories = [[[] for _ in range(self.num_generations)] for _ in range(num_samples)]
+        remaining_agents = self.num_agents
+
+        if self.accelerator.is_main_process:
+            logger.info(f"Starting multi-turn generation: {num_samples} samples, {self.num_generations} generations, {self.num_turns} turns")
+
+        with torch.no_grad(): # Ensure Inference Mode
+            for turn_idx in range(self.num_turns):
+                is_public_turn = (turn_idx % 2 == 0)
+                agent_name = "public" if is_public_turn else "private"
+                
+                # Synchronize all processes before switching adapter
+                self.accelerator.wait_for_everyone()
+                self._switch_adapter(agent_name, self.model)
+                self.accelerator.wait_for_everyone()
+                
+                turn_prompts = []
+                for sample_idx in range(num_samples):
+                    orig_prob = problems[sample_idx]
+                    for gen_idx in range(self.num_generations):
+                        hist = current_histories[sample_idx][gen_idx]
+                        
+                        last_public_output = next((out for agent, out in reversed(hist) if agent == "public"), None)
+                        last_private_output = next((out for agent, out in reversed(hist) if agent == "private"), None)
+
+                        if is_public_turn:
+                            prev_outputs_str = "No previous outputs yet."
+                            formatted_outputs = []
+                            if last_public_output: formatted_outputs.append(f"Previous Orchestrator Output:\n{last_public_output}")
+                            if last_private_output: formatted_outputs.append(f"Previous Worker Agent Output:\n{last_private_output}")
+                            if formatted_outputs: prev_outputs_str = "\n\n".join(formatted_outputs)
+
+                            content = PUBLIC_PROMPT.format(original_problem=orig_prob, previous_outputs=prev_outputs_str, num_agents=remaining_agents)
+                            system_prompt = PUBLIC_SYSTEM_PROMPT
+                        else:
+                            content = PRIVATE_PROMPT.format(original_problem=orig_prob, orchestrator_instruction=last_public_output if last_public_output else "")
+                            system_prompt = PRIVATE_SYSTEM_PROMPT
+
+                        messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": content}]
+                        # Store messages directly - _generate_single_turn will handle template application
+                        turn_prompts.append(messages)
+
+                max_len = self.public_agent_max_completion_length if is_public_turn else self.private_agent_max_completion_length
+                
+                # Synchronize before generation
+                self.accelerator.wait_for_everyone()
+                ids_prompts, ids_completions, logprobs, fwd_kwargs = self._generate_single_turn(
+                    turn_prompts, images=None, max_completion_length=max_len
+                )
+                # Synchronize after generation
+                self.accelerator.wait_for_everyone()
+                
+                decoded = self.processing_class.batch_decode(ids_completions, skip_special_tokens=False)
+                
+                for i, content in enumerate(decoded):
+                    sample_idx = i // self.num_generations
+                    gen_idx = i % self.num_generations
+                    answer = self._extract_answer_content(content)
+                    current_histories[sample_idx][gen_idx].append((agent_name, answer))
+                    turn_info.append((agent_name, turn_idx, sample_idx, gen_idx))
+
+                all_turn_prompt_ids.extend(ids_prompts)
+                all_turn_completion_ids.extend(ids_completions)
+                if logprobs: all_turn_logprobs.extend(logprobs)
+                else: all_turn_logprobs.extend([None] * len(ids_prompts))
+                all_forward_kwargs.append(fwd_kwargs)
+                
+                if self.accelerator.is_main_process:
+                    logger.info(f"Completed turn {turn_idx + 1}/{self.num_turns} ({agent_name}): {len(ids_completions)} completions")
+                
+                if is_public_turn: remaining_agents -= 1
+
+        # Merge forward_kwargs from all turns (use the last one if they're all empty)
+        merged_fwd_kwargs = {}
+        for fwd_kw in all_forward_kwargs:
+            if fwd_kw:
+                merged_fwd_kwargs.update(fwd_kw)
+        
+        if self.accelerator.is_main_process:
+            logger.info(f"Multi-turn generation completed: {len(all_turn_completion_ids)} total completions")
+
+        return all_turn_prompt_ids, all_turn_completion_ids, all_turn_logprobs, merged_fwd_kwargs, turn_info
 
     def _generate(self, prompts: list[str], images: Optional[list]):
         device = self.accelerator.device
@@ -1640,6 +1796,7 @@ class PUBPRIGRPOTrainer(BaseTrainer):
                 # If any logprobs are None, we're not using vLLM, so set to None
                 sampling_per_token_logps = None
             else:
+                logger.info("Sampling per token logps are available")
                 # All logprobs are available (vLLM case), convert to tensors
                 sampling_per_token_logps = [torch.tensor(logps, device=device) for logps in sampling_per_token_logps_list]
                 sampling_per_token_logps = pad(sampling_per_token_logps, padding_value=0.0, padding_side="right")
@@ -1668,7 +1825,7 @@ class PUBPRIGRPOTrainer(BaseTrainer):
         num_images = [len(img_list) for img_list in images] if images is not None else None
 
         with torch.no_grad():
-             # ... (old_per_token_logps 계산 등 기존 코드 유지) ...
+          
              generate_every = self.args.steps_per_generation * self.num_iterations
              if self.args.gradient_accumulation_steps % generate_every != 0 or (
                  self.use_vllm and self.vllm_importance_sampling_correction
@@ -1720,93 +1877,136 @@ class PUBPRIGRPOTrainer(BaseTrainer):
         prompts_text = self.processing_class.batch_decode(prompt_ids, skip_special_tokens=True)
         completions_text = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
         
-        # Group completions by trajectory using batch operations
-        # Structure: num_samples prompts -> each generates num_generations trajectories -> each trajectory has num_turns
-        # So total completions = num_samples * num_generations * num_turns
+        # Group completions by trajectory using turn_info to keep samples/generations isolated.
         num_samples = len(prompts)  # Original number of samples
         total_completions = num_samples * self.num_generations * self.num_turns
-        
-        # Reshape completions_text into (num_samples, num_generations, num_turns) structure
-        # First, ensure we have the right number of completions
-        if len(completions_text) < total_completions:
-            # Pad if necessary
-            completions_text.extend([""] * (total_completions - len(completions_text)))
-        
-        # Reshape using tensor operations for efficiency
-        completions_array = completions_text[:total_completions]
-        completions_reshaped = [
-            completions_array[sample_idx * self.num_generations * self.num_turns + 
-                             gen_idx * self.num_turns:
-                             sample_idx * self.num_generations * self.num_turns + 
-                             gen_idx * self.num_turns + self.num_turns]
-            for sample_idx in range(num_samples)
-            for gen_idx in range(self.num_generations)
-        ]
-        
+
+        completions_per_trajectory = [[None] * self.num_turns for _ in range(num_samples * self.num_generations)]
+        for completion_text, info in zip(completions_text[:total_completions], turn_info[:total_completions]):
+            _, turn_idx, sample_idx, gen_idx = info
+            traj_idx = sample_idx * self.num_generations + gen_idx
+            completions_per_trajectory[traj_idx][turn_idx] = completion_text
+
+        # Fill any missing slots defensively
+        for traj in completions_per_trajectory:
+            for i in range(self.num_turns):
+                if traj[i] is None:
+                    raise ValueError(f"Completion text is missing for turn {i} of trajectory {traj}")
+
         # Convert to the expected format
-        completions_per_trajectory = []
-        for trajectory_completions in completions_reshaped:
+        formatted_trajectories = []
+        for trajectory_completions in completions_per_trajectory:
             formatted_trajectory = []
             for completion_text in trajectory_completions:
                 if is_conversational(inputs[0]):
                     formatted_trajectory.append([{"role": "assistant", "content": completion_text}])
                 else:
                     formatted_trajectory.append(completion_text)
-            completions_per_trajectory.append(formatted_trajectory)
-        
-        # Calculate rewards for each trajectory
-        # Accuracy reward: check only the last private agent output
-        # Format reward: check all turns
-        rewards_per_trajectory = self._calculate_trajectory_rewards(
-            inputs, prompts, completions_per_trajectory, completion_ids_list, turn_info
-        )
-        
-        rewards_per_trajectory = rewards_per_trajectory.unsqueeze(1) 
-        
-        # 2. (Num_Trajectories, Num_Turns) 형태로 확장 (모든 턴에 같은 Trajectory Reward 복사)
-        rewards_matrix = rewards_per_trajectory.repeat(1, self.num_turns)
-        
-        # 3. Transpose하여 (Num_Turns, Num_Trajectories) 형태로 변경
-        #    이렇게 해야 Flatten 했을 때 [Turn0_AllTrajs, Turn1_AllTrajs...] 순서가 됨
-        rewards_matrix_t = rewards_matrix.transpose(0, 1)
-        
-        # 4. Flatten하여 1차원 텐서로 변환
-        rewards = rewards_matrix_t.reshape(-1)
-        
-        # For compatibility with existing code, create rewards_per_func structure
-        # Shape: (num_samples * num_generations * num_turns, 1)
-        rewards_per_func = rewards.unsqueeze(1) if rewards.dim() == 1 else rewards
+            formatted_trajectories.append(formatted_trajectory)
 
-        # Apply weights to each reward function's output and sum
-        # Note: rewards_per_func is already a single column, so we just use it directly
-        rewards = rewards_per_func.squeeze(1) if rewards_per_func.dim() > 1 else rewards_per_func
+        completions_per_trajectory = formatted_trajectories
+        
+        # Calculate rewards for each trajectory (total, accuracy, format)
+        rewards_per_trajectory = self._calculate_rewards(inputs, completions_per_trajectory)
+        
+        # -------------------------------------------------------------------------
+        # [LOGGING] Trajectory-level logging for WandB Table
+        # -------------------------------------------------------------------------
+        if hasattr(self, "_trajectory_buffer"):
+            local_traj_logs = []
+            # 'completions_per_trajectory' has been formatted (possibly list of dicts), 
+            # so we use the formatted version or extract content. 
+            # Since 'formatted_trajectories' structure depends on 'is_conversational',
+            # it's safer to use the text we formatted or just use the raw text if available.
+            # Actually, 'formatted_trajectories' was built from 'completions_per_trajectory' (the raw text list) in the loop above.
+            # But we lost the raw list reference unless we kept it.
+            # Let's extract from formatted_trajectories.
+            
+            for traj_idx, traj_content in enumerate(completions_per_trajectory):
+                input_idx = traj_idx // self.num_generations
+                problem_text = problems[input_idx]
+                
+                # Retrieve reward (scalar)
+                # rewards_per_trajectory is (NumTraj,) tensor
+                reward_val = rewards_per_trajectory[traj_idx].item()
+                
+                log_entry = {
+                    "step": self.state.global_step,
+                    "problem": problem_text,
+                    "reward": reward_val
+                }
+                
+                # Extract turns
+                # traj_content is a list of turns. Each turn is either a string or [{"role":..., "content":...}]
+                for turn_i, turn_data in enumerate(traj_content):
+                    agent = "public" if turn_i % 2 == 0 else "private"
+                    
+                    if isinstance(turn_data, list) and isinstance(turn_data[0], dict):
+                        text = turn_data[0].get("content", "")
+                    else:
+                        text = str(turn_data)
+                        
+                    log_entry[f"turn_{turn_i}_{agent}"] = text
+                
+                local_traj_logs.append(log_entry)
+            
+            # Store locally first, gather only at log time to save bandwidth and memory
+            self._trajectory_buffer.extend(local_traj_logs)
 
-        # Compute grouped-wise rewards
-        # Group by trajectory: each trajectory has num_turns turns
-        # Structure: num_samples * num_generations trajectories, each with num_turns
-        num_trajectories = len(prompts) * self.num_generations
-        rewards_reshaped = rewards.view(num_trajectories, self.num_turns)
-        mean_grouped_rewards = rewards_reshaped.mean(dim=1)
+        # -------------------------------------------------------------------------
+        # [FIX] Advantage Calculation Logic
+        # GRPO: Group Relative Policy Optimization
+        # We must group by Input (Sample) and normalize across Generations.
+        # -------------------------------------------------------------------------
 
-        # Normalize the rewards to compute the advantages
-        mean_grouped_rewards = mean_grouped_rewards.repeat_interleave(self.num_turns, dim=0)
-        advantages = rewards - mean_grouped_rewards
-
-        if self.scale_rewards in ["group", "none"]:
-            # If self.scale_rewards = "none", we'll still log group level std
-            std_rewards = rewards_reshaped.std(dim=1)
-            std_rewards = std_rewards.repeat_interleave(self.num_turns, dim=0)
+        # rewards_per_trajectory shape: (NumSamples * NumGenerations,)
+        # Reshape to (NumSamples, NumGenerations) to compute stats per input problem
+        rewards_by_sample = rewards_per_trajectory.view(-1, self.num_generations)
+        
+        # Compute Mean/Std across generations (dim=1) for each sample
+        # This ensures we compare generations from the SAME input.
+        mean_rewards = rewards_by_sample.mean(dim=1, keepdim=True)
+        std_rewards = rewards_by_sample.std(dim=1, keepdim=True)
+        
+        # Calculate Advantages per trajectory
+        if self.scale_rewards == "group":
+            # Normalize within the group (Sample)
+            advantages_by_sample = (rewards_by_sample - mean_rewards) / (std_rewards + 1e-4)
         elif self.scale_rewards == "batch":
-            # Compute global std
-            std_rewards = rewards.std().expand_as(rewards)
-        else:
-            raise ValueError(
-                f"Invalid value for scale_rewards: {self.scale_rewards}. Must be one of 'batch', 'group', or 'none'."
-            )
+            # Normalize across the entire batch
+            advantages_by_sample = (rewards_by_sample - rewards_by_sample.mean()) / (rewards_by_sample.std() + 1e-4)
+        else: # "none"
+            advantages_by_sample = rewards_by_sample - mean_rewards
 
-        is_std_zero = torch.isclose(std_rewards, torch.zeros_like(std_rewards))
-        if self.scale_rewards != "none":
-            advantages = advantages / (std_rewards + 1e-4)
+        # Flatten back to Trajectory level: (NumSamples * NumGenerations,)
+        advantages_traj = advantages_by_sample.view(-1)
+
+        # -------------------------------------------------------------------------
+        # [FIX] Expand Advantages & Rewards to Turns
+        # Data Layout in input_ids/completion_ids is: [Turn0_AllTrajs, Turn1_AllTrajs, ...]
+        # So we need to match this layout (NumTurns, NumTraj) -> Flatten
+        # -------------------------------------------------------------------------
+        
+        # Expand Advantages: (NumTraj,) -> (1, NumTraj) -> (NumTurns, NumTraj) -> Flatten
+        advantages = advantages_traj.unsqueeze(0).repeat(self.num_turns, 1).reshape(-1)
+        
+        # Expand Rewards (for logging compatibility): Same logic
+        # rewards_per_trajectory: (NumTraj,)
+        rewards = rewards_per_trajectory.unsqueeze(0).repeat(self.num_turns, 1).reshape(-1)
+        
+        # For compatibility with existing code structure (rewards_per_func logic)
+        rewards_per_func = rewards.unsqueeze(1) 
+
+        # Metrics logging helper
+        if self.scale_rewards == "batch":
+            std_val = rewards_by_sample.std()
+            is_std_zero = torch.isclose(std_val, torch.zeros_like(std_val))
+            mean_std_log = std_val.item()
+        else:
+            is_std_zero = (std_rewards < 1e-6)
+            mean_std_log = std_rewards.mean().item()
+            
+        mean_grouped_rewards_log = mean_rewards.mean().item()
 
         # Slice to keep only the local part of the data
         # Note: advantages now has shape (num_trajectories * num_turns,)
@@ -1838,7 +2038,7 @@ class PUBPRIGRPOTrainer(BaseTrainer):
             mean_rewards = torch.nanmean(rewards_per_func.squeeze(1)).item()
             for reward_func_name in self.reward_func_names:
                 self._metrics[mode][f"rewards/{reward_func_name}/mean"].append(mean_rewards)
-                self._metrics[mode][f"rewards/{reward_func_name}/std"].append(std_rewards.mean().item())
+                self._metrics[mode][f"rewards/{reward_func_name}/std"].append(mean_std_log)
         else:
             for i, reward_func_name in enumerate(self.reward_func_names):
                 if rewards_per_func.size(1) > i:
@@ -1846,8 +2046,8 @@ class PUBPRIGRPOTrainer(BaseTrainer):
                     self._metrics[mode][f"rewards/{reward_func_name}/mean"].append(mean_rewards)
                     std_func_rewards = nanstd(rewards_per_func[:, i]).item()
                     self._metrics[mode][f"rewards/{reward_func_name}/std"].append(std_func_rewards)
-        self._metrics[mode]["reward"].append(mean_grouped_rewards.mean().item())
-        self._metrics[mode]["reward_std"].append(std_rewards.mean().item())
+        self._metrics[mode]["reward"].append(mean_grouped_rewards_log)
+        self._metrics[mode]["reward_std"].append(mean_std_log)
         self._metrics[mode]["frac_reward_zero_std"].append(is_std_zero.float().mean().item())
 
         # Log prompt and completion texts
@@ -1905,7 +2105,7 @@ class PUBPRIGRPOTrainer(BaseTrainer):
             "prompt_mask": prompt_mask,
             "completion_ids": completion_ids,
             "completion_mask": completion_mask,
-            "advantages": rewards_per_func.squeeze(1) if rewards_per_func.dim() > 1 else rewards_per_func, # advantages는 Flatten된 상태여야 함
+            "advantages": advantages, # advantages는 Flatten된 상태여야 함
             # "num_items_in_batch": num_items_in_batch,  <-- 제거됨 (Shuffle 에러 원인)
             "turn_info": turn_info,
         }
@@ -1984,6 +2184,9 @@ class PUBPRIGRPOTrainer(BaseTrainer):
         # 일반 GRPO (turn_info 없음) 처리
         if not turn_info:
             return self._compute_loss(model, inputs)
+
+        # Ensure the correct adapter is active for the public-agent loss.
+        self._switch_adapter("public", model)
 
         public_indices = [i for i, info in enumerate(turn_info) if info[0] == "public"]
         private_indices = [i for i, info in enumerate(turn_info) if info[0] == "private"]
@@ -2222,6 +2425,11 @@ class PUBPRIGRPOTrainer(BaseTrainer):
         super().log(logs, start_time)
         self._metrics[mode].clear()
 
+        # Gather logs from all processes
+        all_trajectories = []
+        if hasattr(self, "_trajectory_buffer") and self._trajectory_buffer:
+             all_trajectories = gather_object(self._trajectory_buffer)
+
         if self.accelerator.is_main_process and self.log_completions:
             if is_rich_available():
                 print_prompt_completions_sample(
@@ -2254,6 +2462,15 @@ class PUBPRIGRPOTrainer(BaseTrainer):
                 if self.wandb_log_unique_prompts:
                     df = df.drop_duplicates(subset=["prompt"])
                 wandb.log({"completions": wandb.Table(dataframe=df)})
+            
+                # Log Trajectory Table
+                if all_trajectories:
+                    df_traj = pd.DataFrame(all_trajectories)
+                    wandb.log({"trajectories": wandb.Table(dataframe=df_traj)})
+        
+        # Clear buffer on ALL processes to prevent memory leak
+        if hasattr(self, "_trajectory_buffer"):
+            self._trajectory_buffer.clear()
 
     # Ensure the model card is saved along with the checkpoint
     def _save_checkpoint(self, model, trial):
@@ -2294,99 +2511,6 @@ class PUBPRIGRPOTrainer(BaseTrainer):
         if match:
             return match.group(1).strip()
         return content
-    
-    def _generate_multi_turn(self, prompts: list, images: Optional[list], problems: list[str], solutions: list[str]):
-        device = self.accelerator.device
-        num_samples = len(prompts)
-        
-        all_turn_prompt_ids = []
-        all_turn_completion_ids = []
-        all_turn_logprobs = []
-        turn_info = []
-        all_forward_kwargs = []
-
-        current_histories = [[[] for _ in range(self.num_generations)] for _ in range(num_samples)]
-        remaining_agents = self.num_agents
-
-        if self.accelerator.is_main_process:
-            logger.info(f"Starting multi-turn generation: {num_samples} samples, {self.num_generations} generations, {self.num_turns} turns")
-
-        with torch.no_grad(): # Ensure Inference Mode
-            for turn_idx in range(self.num_turns):
-                is_public_turn = (turn_idx % 2 == 0)
-                agent_name = "public" if is_public_turn else "private"
-                
-                # Synchronize all processes before switching adapter
-                self.accelerator.wait_for_everyone()
-                self._switch_adapter(agent_name, self.model)
-                self.accelerator.wait_for_everyone()
-                
-                turn_prompts = []
-                for sample_idx in range(num_samples):
-                    orig_prob = problems[sample_idx]
-                    for gen_idx in range(self.num_generations):
-                        hist = current_histories[sample_idx][gen_idx]
-                        
-                        last_public_output = next((out for agent, out in reversed(hist) if agent == "public"), None)
-                        last_private_output = next((out for agent, out in reversed(hist) if agent == "private"), None)
-
-                        if is_public_turn:
-                            prev_outputs_str = "No previous outputs yet."
-                            formatted_outputs = []
-                            if last_public_output: formatted_outputs.append(f"Previous Orchestrator Output:\n{last_public_output}")
-                            if last_private_output: formatted_outputs.append(f"Previous Worker Agent Output:\n{last_private_output}")
-                            if formatted_outputs: prev_outputs_str = "\n\n".join(formatted_outputs)
-
-                            content = PUBLIC_PROMPT.format(original_problem=orig_prob, previous_outputs=prev_outputs_str, num_agents=remaining_agents)
-                            system_prompt = PUBLIC_SYSTEM_PROMPT
-                        else:
-                            content = PRIVATE_PROMPT.format(original_problem=orig_prob, orchestrator_instruction=last_public_output if last_public_output else "")
-                            system_prompt = PRIVATE_SYSTEM_PROMPT
-
-                        messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": content}]
-                        # Store messages directly - _generate_single_turn will handle template application
-                        turn_prompts.append(messages)
-
-                max_len = self.public_agent_max_completion_length if is_public_turn else self.private_agent_max_completion_length
-                
-                # Synchronize before generation
-                self.accelerator.wait_for_everyone()
-                ids_prompts, ids_completions, logprobs, fwd_kwargs = self._generate_single_turn(
-                    turn_prompts, images=None, max_completion_length=max_len
-                )
-                # Synchronize after generation
-                self.accelerator.wait_for_everyone()
-                
-                decoded = self.processing_class.batch_decode(ids_completions, skip_special_tokens=False)
-                
-                for i, content in enumerate(decoded):
-                    sample_idx = i // self.num_generations
-                    gen_idx = i % self.num_generations
-                    answer = self._extract_answer_content(content)
-                    current_histories[sample_idx][gen_idx].append((agent_name, answer))
-                    turn_info.append((agent_name, turn_idx, sample_idx, gen_idx))
-
-                all_turn_prompt_ids.extend(ids_prompts)
-                all_turn_completion_ids.extend(ids_completions)
-                if logprobs: all_turn_logprobs.extend(logprobs)
-                else: all_turn_logprobs.extend([None] * len(ids_prompts))
-                all_forward_kwargs.append(fwd_kwargs)
-                
-                if self.accelerator.is_main_process:
-                    logger.info(f"Completed turn {turn_idx + 1}/{self.num_turns} ({agent_name}): {len(ids_completions)} completions")
-                
-                if is_public_turn: remaining_agents -= 1
-
-        # Merge forward_kwargs from all turns (use the last one if they're all empty)
-        merged_fwd_kwargs = {}
-        for fwd_kw in all_forward_kwargs:
-            if fwd_kw:
-                merged_fwd_kwargs.update(fwd_kw)
-        
-        if self.accelerator.is_main_process:
-            logger.info(f"Multi-turn generation completed: {len(all_turn_completion_ids)} total completions")
-
-        return all_turn_prompt_ids, all_turn_completion_ids, all_turn_logprobs, merged_fwd_kwargs, turn_info
         
     def training_step(self, model, inputs, num_items_in_batch=None):
         model.train()
