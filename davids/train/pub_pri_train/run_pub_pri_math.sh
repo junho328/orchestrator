@@ -33,6 +33,8 @@ GENERATION_BATCH_SIZE=${GENERATION_BATCH_SIZE:-8}
 STEPS_PER_GENERATION=${STEPS_PER_GENERATION:-1}
 NUM_GENERATIONS=${NUM_GENERATIONS:-8}
 BETA=${BETA:-0.0}
+LOSS_TYPE=${LOSS_TYPE:-"grpo"}
+SCALE_REWARDS=${LOSS_TYPE:-"group"}
 
 #VLLM GPU UTILIZATION
 GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-0.6}
@@ -84,7 +86,8 @@ nohup accelerate launch \
     --generation_batch_size "$GENERATION_BATCH_SIZE" \
     --num_generations "$NUM_GENERATIONS" \
     --beta "$BETA" \
-    --loss_type dr_grpo \
+    --loss_type "$LOSS_TYPE" \
+    --scale_rewards "$SCALE_REWARDS" \
     --use_peft \
     --project "$WANDB_PROJECT" \
     --run_name "$WANDB_RUN_NAME" \
@@ -99,6 +102,7 @@ nohup accelerate launch \
     --use_vllm \
     --vllm_mode colocate \
     --vllm_gpu_memory_utilization "$GPU_MEMORY_UTILIZATION" \
+    --ddp_find_unused_parameters True \
     > train.log 2>&1 &
 
 # python -m davids.train.pub_pri_train.pub_pri_math_train \
