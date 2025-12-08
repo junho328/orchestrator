@@ -93,6 +93,7 @@ nohup accelerate launch \
     --run_name "$WANDB_RUN_NAME" \
     --report_to wandb \
     --log_completions \
+    --logging_steps 1 \
     --seed "$SEED" \
     --gradient_checkpointing "$GRADIENT_CHECKPOINTING" \
     --num_agents "$NUM_AGENTS" \
