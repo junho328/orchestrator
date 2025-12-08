@@ -7,6 +7,7 @@ from contextlib import nullcontext
 from functools import partial
 from pathlib import Path
 from typing import Any, Callable, Optional, Union, List
+from contextlib import nullcontext
 
 import transformers
 from accelerate import logging
@@ -2178,40 +2179,91 @@ class PUBPRIGRPOTrainer(BaseTrainer):
         
         mode = "train" if self.model.training else "eval"
         total_loss_detached = torch.tensor(0.0, device=self.accelerator.device)
+        
+        is_ddp_model = hasattr(model, "no_sync")
 
         # ==================================================================
         # STEP 1: Public Agent Update & Memory Release
         # ==================================================================
         
-        if public_indices:
-            public_inputs = self._extract_agent_inputs(inputs, public_indices)
-            if self.use_liger_loss:
-                unwrapped_model = self.accelerator.unwrap_model(model)
-                public_loss = self._forward_redirection(model, unwrapped_model, self.compute_liger_loss, unwrapped_model, public_inputs)
-            else:
-                public_loss = self._compute_loss(model, public_inputs)
+        sync_context = model.no_sync() if (is_ddp_model and private_indices) else nullcontext()
+        
+        # if public_indices:
+        #     public_inputs = self._extract_agent_inputs(inputs, public_indices)
+        #     if self.use_liger_loss:
+        #         unwrapped_model = self.accelerator.unwrap_model(model)
+        #         public_loss = self._forward_redirection(model, unwrapped_model, self.compute_liger_loss, unwrapped_model, public_inputs)
+        #     else:
+        #         public_loss = self._compute_loss(model, public_inputs)
             
-            # 로깅용 값만 따로 저장 (Graph와 끊김)
-            public_loss_val = public_loss.detach()
-            self._metrics[mode]["loss/public"].append(public_loss_val.item())
-            total_loss_detached += public_loss_val
-        else:
-            # DDP 동기화를 위한 Dummy Loss
-            public_loss = sum(p.sum() for p in model.parameters() if p.requires_grad) * 0.0
+        #     # 로깅용 값만 따로 저장 (Graph와 끊김)
+        #     public_loss_val = public_loss.detach()
+        #     self._metrics[mode]["loss/public"].append(public_loss_val.item())
+        #     total_loss_detached += public_loss_val
+        # else:
+        #     # DDP 동기화를 위한 Dummy Loss
+        #     public_loss = sum(p.sum() for p in model.parameters() if p.requires_grad) * 0.0
 
         # [핵심] Backward 수행 -> 계산 그래프 메모리 해제됨 (retain_graph=False 기본값)
-        self.accelerator.backward(public_loss)
+        # self.accelerator.backward(public_loss)
         
         # [핵심] 텐서 변수 삭제 (Reference Count 감소 -> 메모리 반환 유도)
-        del public_loss
-        if 'public_inputs' in locals(): del public_inputs
+        # del public_loss
+        # if 'public_inputs' in locals(): del public_inputs
         
         # 선택사항: VRAM 파편화가 심하면 강제 정리 (속도는 약간 느려질 수 있음)
         # torch.cuda.empty_cache() 
+        
+        with sync_context:
+            if public_indices:
+                public_inputs = self._extract_agent_inputs(inputs, public_indices)
+                if self.use_liger_loss:
+                    unwrapped_model = self.accelerator.unwrap_model(model)
+                    public_loss = self._forward_redirection(model, unwrapped_model, self.compute_liger_loss, unwrapped_model, public_inputs)
+                else:
+                    public_loss = self._compute_loss(model, public_inputs)
+                
+                # 로깅용 값만 따로 저장
+                public_loss_val = public_loss.detach()
+                self._metrics[mode]["loss/public"].append(public_loss_val.item())
+                total_loss_detached += public_loss_val
+
+                # Backward 수행 (no_sync 내부이므로 로컬에 Gradient만 누적됨)
+                self.accelerator.backward(public_loss)
+                
+                # 메모리 정리
+                del public_loss
+                if 'public_inputs' in locals(): del public_inputs
+            else:
+                # Public 데이터가 없는 경우, DDP 파라미터 정합성을 위해 아무것도 하지 않음
+                pass
 
         # ==================================================================
         # STEP 2: Private Agent Update
         # ==================================================================
+        # self._switch_adapter("private", model)
+
+        # if private_indices:
+        #     private_inputs = self._extract_agent_inputs(inputs, private_indices)
+        #     if self.use_liger_loss:
+        #         unwrapped_model = self.accelerator.unwrap_model(model)
+        #         private_loss = self._forward_redirection(model, unwrapped_model, self.compute_liger_loss, unwrapped_model, private_inputs)
+        #     else:
+        #         private_loss = self._compute_loss(model, private_inputs)
+
+        #     private_loss_val = private_loss.detach()
+        #     self._metrics[mode]["loss/private"].append(private_loss_val.item())
+        #     total_loss_detached += private_loss_val
+        # else:
+        #     private_loss = sum(p.sum() for p in model.parameters() if p.requires_grad) * 0.0
+
+        # # Backward 수행 -> 계산 그래프 메모리 해제
+        # self.accelerator.backward(private_loss)
+        
+        # 메모리 정리
+        # del private_loss
+        # if 'private_inputs' in locals(): del private_inputs
+        
         self._switch_adapter("private", model)
 
         if private_indices:
@@ -2225,15 +2277,18 @@ class PUBPRIGRPOTrainer(BaseTrainer):
             private_loss_val = private_loss.detach()
             self._metrics[mode]["loss/private"].append(private_loss_val.item())
             total_loss_detached += private_loss_val
+            
+            # Backward 수행 (여기서 DDP All-Reduce 발생)
+            self.accelerator.backward(private_loss)
+            
+            # 메모리 정리
+            del private_loss
+            if 'private_inputs' in locals(): del private_inputs
         else:
-            private_loss = sum(p.sum() for p in model.parameters() if p.requires_grad) * 0.0
-
-        # Backward 수행 -> 계산 그래프 메모리 해제
-        self.accelerator.backward(private_loss)
-        
-        # 메모리 정리
-        del private_loss
-        if 'private_inputs' in locals(): del private_inputs
+            # Private 데이터가 없는 경우라도, Public에서 no_sync로 누적된 Gradient가 있다면 Sync를 해줘야 함.
+            # 하지만 Private Adapter가 활성화된 상태에서 forward 없이 backward를 부를 순 없으므로,
+            # Public만 있는 경우엔 위 sync_context 로직에 의해 Public 단계에서 이미 Sync가 되었을 것임.
+            pass
         
         # ==================================================================
         # 결과 반환
