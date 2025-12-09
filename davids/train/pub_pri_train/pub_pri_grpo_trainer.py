@@ -470,6 +470,15 @@ class PUBPRIGRPOTrainer(BaseTrainer):
             "advantages": deque(maxlen=log_buffer_size),
         }
         self._trajectory_buffer = []
+        
+        # Completion saving configuration
+        self.save_completions = getattr(args, 'save_completions', True)
+        self.save_completions_path = getattr(args, 'save_completions_path', None)
+        if self.save_completions_path is None:
+            self.save_completions_path = os.path.join(args.output_dir, "completions")
+        if self.accelerator.is_main_process and self.save_completions:
+            os.makedirs(self.save_completions_path, exist_ok=True)
+        self._completions_to_save = []
 
         # Ensure each process receives a unique seed to prevent duplicate completions when generating with
         # transformers if num_generations exceeds per_device_train_batch_size. We could skip it if we use vLLM, but
@@ -1221,7 +1230,7 @@ class PUBPRIGRPOTrainer(BaseTrainer):
         """
         Calculate per-trajectory rewards.
 
-        - Accuracy: 1.0 if the *last* turn matches the gold solution, else 0.0 (None -> 0.0)
+        - Accuracy: 1.0 if the *last* turn matches the gold answer, else 0.0 (None -> 0.0)
         - Format: 0.5 if *all* turns contain <think>...</think> and <answer>...</answer>, else 0.0
         """
         device = self.accelerator.device
@@ -1231,7 +1240,7 @@ class PUBPRIGRPOTrainer(BaseTrainer):
             empty = torch.zeros(0, device=device)
             return empty, empty, empty
 
-        solutions = [example.get("solution", "") for example in inputs for _ in range(self.num_generations)]
+        answers = [example.get("answer", "") for example in inputs for _ in range(self.num_generations)]
 
         def _to_message(turn) -> list[dict[str, str]]:
             # Normalize any turn (str | dict | list) into a single assistant message for reward functions
@@ -1252,7 +1261,7 @@ class PUBPRIGRPOTrainer(BaseTrainer):
 
         # Accuracy on the last turn of each trajectory
         acc_inputs = [_to_message(traj[-1]) for traj in completions_per_trajectory]
-        acc_scores_list = accuracy_reward(completions=acc_inputs, solution=solutions)
+        acc_scores_list = accuracy_reward(completions=acc_inputs, solution=answers)
         acc_scores = torch.tensor(
             [score if score is not None else 0.0 for score in acc_scores_list],
             dtype=torch.float32,
@@ -1266,12 +1275,16 @@ class PUBPRIGRPOTrainer(BaseTrainer):
 
         num_turns = len(completions_per_trajectory[0])
         fmt_scores_matrix = flat_fmt_tensor.view(num_trajectories, num_turns)
+        
         all_formatted = (fmt_scores_matrix >= 0.5).all(dim=1)
         format_rewards = torch.where(
             all_formatted,
             torch.full_like(acc_scores, 0.5),
             torch.zeros_like(acc_scores),
         )
+
+        # format_compliance_rate = fmt_scores_matrix.float().mean(dim=1)
+        # format_rewards = format_compliance_rate * 0.5
 
         rewards = acc_scores + format_rewards
         return rewards, acc_scores, format_rewards
@@ -1306,7 +1319,7 @@ class PUBPRIGRPOTrainer(BaseTrainer):
         # Total reward (acc + format) for compatibility with downstream code
         self._logs["rewards"]["total"].extend(gathered_rewards.tolist())
 
-        return rewards_per_trajectory
+        return rewards_per_trajectory, acc_scores, format_rewards
 
     def _generate_single_turn(self, prompts: list[str], images: Optional[list], max_completion_length: Optional[int] = None):
         device = self.accelerator.device
@@ -1596,7 +1609,7 @@ class PUBPRIGRPOTrainer(BaseTrainer):
 
         return prompt_ids, completion_ids, logprobs, forward_kwargs
     
-    def _generate_multi_turn(self, prompts: list, images: Optional[list], problems: list[str], solutions: list[str]):
+    def _generate_multi_turn(self, prompts: list, images: Optional[list], problems: list[str], answers: list[str]):
         device = self.accelerator.device
         num_samples = len(prompts)
         
@@ -1694,10 +1707,10 @@ class PUBPRIGRPOTrainer(BaseTrainer):
         mode = "train" if self.model.training else "eval"
 
         # Use multi-turn generation for public-private agent setup
-        # Extract problems and solutions from inputs if available
+        # Extract problems and answers from inputs if available
         problems = getattr(self, '_current_problems', prompts)
-        solutions = getattr(self, '_current_solutions', [""] * len(prompts))
-        prompt_ids, completion_ids, logprobs, forward_kwargs, turn_info = self._generate_multi_turn(prompts, images, problems, solutions)
+        answers = getattr(self, '_current_answers', [""] * len(prompts))
+        prompt_ids, completion_ids, logprobs, forward_kwargs, turn_info = self._generate_multi_turn(prompts, images, problems, answers)
 
         # Get completion length per sequence, used for logging
         prompt_lengths = torch.tensor([len(ids) for ids in prompt_ids], device=device)
@@ -1740,13 +1753,13 @@ class PUBPRIGRPOTrainer(BaseTrainer):
         device = self.accelerator.device
         mode = "train" if self.model.training else "eval"
 
-        # Extract problem and solution from inputs
+        # Extract problem and answer from inputs
         problems = [x.get("problem", x.get("prompt", "")) for x in inputs]
-        solutions = [x.get("solution", "") for x in inputs]
+        answers = [x.get("answer", "") for x in inputs]
         
         # Store for use in _generate
         self._current_problems = problems
-        self._current_solutions = solutions
+        self._current_answers = answers
         
         # Create initial prompts using chat template and PUBLIC_PROMPT
         prompts = []
@@ -1912,41 +1925,41 @@ class PUBPRIGRPOTrainer(BaseTrainer):
         completions_per_trajectory = formatted_trajectories
         
         # Calculate rewards for each trajectory (total, accuracy, format)
-        rewards_per_trajectory = self._calculate_rewards(inputs, completions_per_trajectory)
+        rewards_per_trajectory, acc_scores, format_rewards = self._calculate_rewards(inputs, completions_per_trajectory)
         
         # -------------------------------------------------------------------------
         # [LOGGING] Trajectory-level logging for WandB Table
         # -------------------------------------------------------------------------
         if hasattr(self, "_trajectory_buffer"):
             local_traj_logs = []
-            # 'completions_per_trajectory' has been formatted (possibly list of dicts), 
-            # so we use the formatted version or extract content. 
-            # Since 'formatted_trajectories' structure depends on 'is_conversational',
-            # it's safer to use the text we formatted or just use the raw text if available.
-            # Actually, 'formatted_trajectories' was built from 'completions_per_trajectory' (the raw text list) in the loop above.
-            # But we lost the raw list reference unless we kept it.
-            # Let's extract from formatted_trajectories.
             
             for traj_idx, traj_content in enumerate(completions_per_trajectory):
                 input_idx = traj_idx // self.num_generations
+                gen_idx = traj_idx % self.num_generations
                 problem_text = problems[input_idx]
+                answer_text = answers[input_idx]
                 
-                # Retrieve reward (scalar)
-                # rewards_per_trajectory is (NumTraj,) tensor
-                reward_val = rewards_per_trajectory[traj_idx].item()
+                # Retrieve rewards (scalars)
+                reward_val = rewards_per_trajectory[traj_idx].item() if traj_idx < len(rewards_per_trajectory) else 0.0
+                acc_val = acc_scores[traj_idx].item() if traj_idx < len(acc_scores) else 0.0
+                fmt_val = format_rewards[traj_idx].item() if traj_idx < len(format_rewards) else 0.0
                 
                 log_entry = {
                     "step": self.state.global_step,
+                    "sample_idx": input_idx,
+                    "generation_idx": gen_idx,
                     "problem": problem_text,
-                    "reward": reward_val
+                    "answer": answer_text,
+                    "total_reward": reward_val,
+                    "accuracy_reward": acc_val,
+                    "format_reward": fmt_val,
                 }
                 
                 # Extract turns
-                # traj_content is a list of turns. Each turn is either a string or [{"role":..., "content":...}]
                 for turn_i, turn_data in enumerate(traj_content):
                     agent = "public" if turn_i % 2 == 0 else "private"
                     
-                    if isinstance(turn_data, list) and isinstance(turn_data[0], dict):
+                    if isinstance(turn_data, list) and len(turn_data) > 0 and isinstance(turn_data[0], dict):
                         text = turn_data[0].get("content", "")
                     else:
                         text = str(turn_data)
@@ -1957,6 +1970,19 @@ class PUBPRIGRPOTrainer(BaseTrainer):
             
             # Store locally first, gather only at log time to save bandwidth and memory
             self._trajectory_buffer.extend(local_traj_logs)
+        
+        # -------------------------------------------------------------------------
+        # [JSON SAVE] Save completions to JSON file for later inspection
+        # -------------------------------------------------------------------------
+        if self.save_completions and self.accelerator.is_main_process:
+            self._collect_completions_for_json(
+                problems=problems,
+                answers=answers,
+                completions_per_trajectory=completions_per_trajectory,
+                rewards_per_trajectory=rewards_per_trajectory,
+                acc_scores=acc_scores,
+                format_rewards=format_rewards,
+            )
 
         # -------------------------------------------------------------------------
         # [FIX] Advantage Calculation Logic
@@ -2251,10 +2277,24 @@ class PUBPRIGRPOTrainer(BaseTrainer):
         # DDP에서 두 adapter에 대한 backward를 모두 완료한 후 동기화
         if is_ddp_model and model.training and torch.distributed.is_initialized():
             world_size = torch.distributed.get_world_size()
-            for param in model.parameters():
-                if param.grad is not None:
-                    torch.distributed.all_reduce(param.grad, op=torch.distributed.ReduceOp.SUM)
-                    param.grad.div_(world_size)
+
+            for name, param in model.named_parameters():
+                if param.grad is None:
+                    continue
+
+                if not param.requires_grad:
+                    continue
+
+                # 3. 수동 All-Reduce (SUM)
+                # Mixed Precision 사용 시 param.grad는 Scaled 상태일 수 있으나,
+                # 단순히 합치고 나누는 선형 연산이므로 All-Reduce -> Div는 안전합니다.
+                torch.distributed.all_reduce(param.grad, op=torch.distributed.ReduceOp.SUM)
+                param.grad.div_(world_size)
+
+            # for param in model.parameters():
+            #     if param.grad is not None:
+            #         torch.distributed.all_reduce(param.grad, op=torch.distributed.ReduceOp.SUM)
+            #         param.grad.div_(world_size)
 
         return total_loss_detached
         
@@ -2417,66 +2457,152 @@ class PUBPRIGRPOTrainer(BaseTrainer):
 
     def log(self, logs: dict[str, float], start_time: Optional[float] = None) -> None:
         mode = "train" if self.model.training else "eval"
-        metrics = {key: sum(val) / len(val) for key, val in self._metrics[mode].items()}  # average the metrics
-
-        # This method can be called both in training and evaluation. When called in evaluation, the keys in `logs`
-        # start with "eval_". We need to add the prefix "eval_" to the keys in `metrics` to match the format.
-        if mode == "eval":
-            metrics = {f"eval_{key}": val for key, val in metrics.items()}
-
-        logs = {**logs, **metrics}
-        super().log(logs, start_time)
-        self._metrics[mode].clear()
-
-        # Gather logs from all processes
-        all_trajectories = []
-        if hasattr(self, "_trajectory_buffer") and self._trajectory_buffer:
-             all_trajectories = gather_object(self._trajectory_buffer)
-
-        if self.accelerator.is_main_process and self.log_completions:
-            if is_rich_available():
-                print_prompt_completions_sample(
-                    self._logs["prompt"],
-                    self._logs["completion"],
-                    self._logs["rewards"],
-                    self._logs["advantages"],
-                    self.state.global_step,
-                    self.num_completions_to_print,
-                )
-
-            if self.args.report_to and "wandb" in self.args.report_to and wandb.run is not None:
-                import pandas as pd
-
-                table = {
-                    "step": [str(self.state.global_step)] * len(self._logs["prompt"]),
-                    "prompt": self._logs["prompt"],
-                    "completion": self._logs["completion"],
-                    **self._logs["rewards"],
-                    "advantage": self._logs["advantages"],
-                }
-
-                if self._logs["images"]:
-                    table["images"] = []
-                    for image_list in self._logs["images"]:
-                        # Convert images to wandb Image objects for proper visualization
-                        table["images"].append([wandb.Image(image) for image in image_list])
-
-                df = pd.DataFrame(table)
-                if self.wandb_log_unique_prompts:
-                    df = df.drop_duplicates(subset=["prompt"])
-                wandb.log({"completions": wandb.Table(dataframe=df)})
-            
-                # Log Trajectory Table
-                if all_trajectories:
-                    df_traj = pd.DataFrame(all_trajectories)
-                    wandb.log({"trajectories": wandb.Table(dataframe=df_traj)})
         
-        # Clear buffer on ALL processes to prevent memory leak
+        # 1. 메트릭 계산 및 logs 딕셔너리 업데이트
+        if mode in self._metrics:
+            metrics = {key: sum(val) / len(val) for key, val in self._metrics[mode].items() if len(val) > 0}
+            if mode == "eval":
+                metrics = {f"eval_{key}": val for key, val in metrics.items()}
+            logs = {**logs, **metrics}
+            self._metrics[mode].clear()
+
+        # 2. Completions 및 Trajectory 로깅 (log_completions=True 일 때만)
+        # 중요: gather_object는 모든 프로세스에서 호출되어야 함 (데드락 방지)
+        all_trajectories = gather_object(self._trajectory_buffer) if hasattr(self, "_trajectory_buffer") else []
+        # 로깅 후 버퍼 비우기 (메모리 누수 방지)
         if hasattr(self, "_trajectory_buffer"):
             self._trajectory_buffer.clear()
 
+        # 메인 프로세스에서만 WandB 로깅 수행
+        if self.accelerator.is_main_process:
+            if self.log_completions:
+                # WandB가 초기화되어 있는지 확인
+                if self.args.report_to and "wandb" in self.args.report_to:
+                    import pandas as pd
+                    if wandb.run is None:
+                        logger.warning("WandB run is not active. Skipping table logging.")
+                    else:
+                        # (A) Per-Turn Completions Table 로깅 (각 턴별 상세 정보)
+                        if len(self._logs["prompt"]) > 0:
+                            prompt_list = list(self._logs["prompt"])
+                            completion_list = list(self._logs["completion"])
+                            advantage_list = list(self._logs["advantages"])
+                            # rewards는 dict of deques -> 리스트로 변환 후 길이 체크
+                            rewards_dict = {k: list(v) for k, v in self._logs["rewards"].items()}
+
+                            # 모든 컬럼 길이 중 최소값으로 절삭 (길이 불일치로 인한 Table 실패 방지)
+                            column_lengths = [
+                                len(prompt_list),
+                                len(completion_list),
+                                len(advantage_list),
+                            ]
+                            # rewards_dict 값들 중 비어있지 않은 것만 체크
+                            for v in rewards_dict.values():
+                                if len(v) > 0:
+                                    column_lengths.append(len(v))
+                            
+                            min_len = min(column_lengths) if column_lengths else 0
+
+                            if min_len == 0:
+                                logger.info("Skipping completions table logging: empty columns after trimming.")
+                            else:
+                                table_data = {
+                                    "step": [self.state.global_step] * min_len,
+                                    "prompt": prompt_list[:min_len],
+                                    "completion": completion_list[:min_len],
+                                    "advantage": advantage_list[:min_len],
+                                }
+
+                                for reward_key, reward_vals in rewards_dict.items():
+                                    if len(reward_vals) >= min_len:
+                                        table_data[f"reward_{reward_key}"] = reward_vals[:min_len]
+
+                                # Images 추가 (존재 시, 길이 맞춰 절삭)
+                                if self._logs["images"]:
+                                    images_list = list(self._logs["images"])
+                                    if len(images_list) >= min_len:
+                                        table_data["images"] = [
+                                            [wandb.Image(img) for img in images] if images else []
+                                            for images in images_list[:min_len]
+                                        ]
+
+                                try:
+                                    df = pd.DataFrame(table_data)
+                                    if self.wandb_log_unique_prompts:
+                                        df = df.drop_duplicates(subset=["prompt"])
+                                    
+                                    # 누적 테이블로 저장 (step별로 덮어쓰지 않음)
+                                    table = wandb.Table(dataframe=df)
+                                    wandb.log({f"completions/step_{self.state.global_step}": table})
+                                    
+                                    logger.info(
+                                        "Logged completions table with %s rows at step %s",
+                                        len(df),
+                                        self.state.global_step,
+                                    )
+                                except Exception as e:
+                                    logger.error(f"Failed to log completions table: {e}", exc_info=True)
+
+                        # (B) Trajectories Table 로깅 (각 샘플의 전체 궤적 정보)
+                        if all_trajectories:
+                            try:
+                                # Flatten nested lists from gather_object
+                                flat_trajectories = []
+                                for item in all_trajectories:
+                                    if isinstance(item, list):
+                                        flat_trajectories.extend(item)
+                                    elif isinstance(item, dict):
+                                        flat_trajectories.append(item)
+                                
+                                if flat_trajectories:
+                                    df_traj = pd.DataFrame(flat_trajectories)
+                                    # Sort by step, sample_idx, generation_idx for readability
+                                    sort_cols = [c for c in ["step", "sample_idx", "generation_idx"] if c in df_traj.columns]
+                                    if sort_cols:
+                                        df_traj = df_traj.sort_values(sort_cols)
+                                    
+                                    # 누적 테이블로 저장 (step별로 덮어쓰지 않음)
+                                    traj_table = wandb.Table(dataframe=df_traj)
+                                    wandb.log({f"trajectories/step_{self.state.global_step}": traj_table})
+                                    
+                                    logger.info(
+                                        "Logged trajectories table with %s rows at step %s",
+                                        len(df_traj),
+                                        self.state.global_step,
+                                    )
+                                else:
+                                    logger.warning(f"No valid trajectory entries to log at step {self.state.global_step}")
+                            except Exception as e:
+                                logger.error(f"Failed to log trajectories table: {e}", exc_info=True)
+                        else:
+                            logger.debug(f"all_trajectories is empty at step {self.state.global_step}")
+            else:
+                # 디버깅을 위해 한 번만 경고 (선택 사항)
+                if self.state.global_step <= self.args.logging_steps:
+                    logger.info("log_completions is False. Tables will not be logged.")
+
+        # 3. JSON 파일로 completions 저장 (main process only)
+        if self.accelerator.is_main_process:
+            self._save_completions_to_json(force=False)
+        
+        # 4. _logs 버퍼 클리어 (메모리 누수 방지)
+        for key in self._logs:
+            if isinstance(self._logs[key], deque):
+                self._logs[key].clear()
+            elif isinstance(self._logs[key], dict):
+                for sub_key in self._logs[key]:
+                    if isinstance(self._logs[key][sub_key], deque):
+                        self._logs[key][sub_key].clear()
+        
+        # 5. 부모 클래스의 log 호출 (WandBCallback 등 트리거)
+        super().log(logs, start_time)
+
     # Ensure the model card is saved along with the checkpoint
     def _save_checkpoint(self, model, trial):
+        # Save any remaining completions before checkpoint
+        if self.accelerator.is_main_process:
+            self._save_completions_to_json(force=True)
+        
         if self.args.hub_model_id is None:
             model_name = Path(self.args.output_dir).name
         else:
@@ -2530,4 +2656,648 @@ class PUBPRIGRPOTrainer(BaseTrainer):
             loss = loss.mean()
         # loss는 이미 detach된 텐서여야 합니다 (compute_loss 수정 참조).
         return loss
+
+    def _compute_pass_at_k(self, n: int, c: int, k: int) -> float:
+        """
+        Compute pass@k metric.
+        
+        Args:
+            n: Total number of samples per problem
+            c: Number of correct samples among n
+            k: Number of samples to consider for pass@k
+            
+        Returns:
+            pass@k probability
+        """
+        if n - c < k:
+            return 1.0
+        # Use the formula: pass@k = 1 - C(n-c, k) / C(n, k)
+        # Computed as: 1 - prod((n-c-i)/(n-i) for i in range(k))
+        result = 1.0
+        for i in range(k):
+            result *= (n - c - i) / (n - i)
+        return 1.0 - result
+
+    @torch.no_grad()
+    def multi_generate_eval(
+        self,
+        eval_data: Union[Dataset, List[dict]],
+        num_samples_per_problem: int = 10,
+        k_values: List[int] = [1, 5, 10],
+        num_agents: Optional[int] = None,
+        max_completion_length_public: Optional[int] = None,
+        max_completion_length_private: Optional[int] = None,
+        batch_size: Optional[int] = None,
+        verbose: bool = True,
+    ) -> dict[str, Any]:
+        """
+        Evaluate multi-agent generation performance using pass@k metric.
+        
+        This function runs multi-turn generation with public/private agents alternating,
+        then compares the final private agent's answer with the ground truth answer.
+        
+        Args:
+            eval_data: Evaluation dataset or list of dicts with 'problem' and 'answer' keys
+            num_samples_per_problem: Number of generation samples per problem (n in pass@k)
+            k_values: List of k values for pass@k computation (e.g., [1, 5, 10])
+            num_turns: Number of turns (public-private pairs). If None, uses self.num_turns
+            max_completion_length_public: Max completion length for public agent. 
+                                          If None, uses self.public_agent_max_completion_length
+            max_completion_length_private: Max completion length for private agent.
+                                           If None, uses self.private_agent_max_completion_length
+            batch_size: Batch size for processing. If None, uses all data at once.
+            verbose: Whether to print progress information
+            
+        Returns:
+            Dictionary containing:
+                - pass@k scores for each k value
+                - per_problem_results: detailed results per problem
+                - overall_accuracy: simple accuracy (pass@1 equivalent)
+                - total_problems: number of problems evaluated
+                - num_samples_per_problem: n value used
+        """
+        device = self.accelerator.device
+        self.model.eval()
+        
+        # Set default values
+        if num_agents is None:
+            num_agents = self.num_agents
+        num_turns = num_agents * 2
+        
+        if max_completion_length_public is None:
+            max_completion_length_public = self.public_agent_max_completion_length
+        if max_completion_length_private is None:
+            max_completion_length_private = self.private_agent_max_completion_length
+        if batch_size is None:
+            batch_size = len(eval_data)
+
+        # Convert dataset to list if needed
+        if isinstance(eval_data, Dataset):
+            eval_data = [eval_data[i] for i in range(len(eval_data))]
+        
+        # Extract problems and answers
+        problems = [item.get("problem", item.get("prompt", "")) for item in eval_data]
+        answers = [item.get("answer", "") for item in eval_data]
+        
+        num_problems = len(problems)
+        
+        # Store results for each problem
+        all_results = []
+        
+        # Process in batches
+        for batch_start in range(0, num_problems, batch_size):
+            batch_end = min(batch_start + batch_size, num_problems)
+            batch_problems = problems[batch_start:batch_end]
+            batch_answers = answers[batch_start:batch_end]
+            
+            # Generate multiple samples per problem
+            batch_results = self._generate_multi_turn_eval_batch(
+                problems=batch_problems,
+                answers=batch_answers,
+                num_samples=num_samples_per_problem,
+                num_turns=num_turns,
+                max_completion_length_public=max_completion_length_public,
+                max_completion_length_private=max_completion_length_private,
+                verbose=verbose,
+            )
+            
+            all_results.extend(batch_results)
+        
+        # Compute pass@k metrics
+        pass_at_k_results = {}
+        for k in k_values:
+            if k > num_samples_per_problem:
+                if verbose and self.accelerator.is_main_process:
+                    logger.warning(f"k={k} > num_samples_per_problem={num_samples_per_problem}, skipping")
+                continue
+            
+            pass_at_k_sum = 0.0
+            for result in all_results:
+                n = result["num_samples"]
+                c = result["num_correct"]
+                pass_at_k_sum += self._compute_pass_at_k(n, c, k)
+            
+            pass_at_k_results[f"pass@{k}"] = pass_at_k_sum / num_problems
+        
+        # Compute overall accuracy (proportion of problems with at least one correct answer)
+        problems_with_correct = sum(1 for r in all_results if r["num_correct"] > 0)
+        overall_accuracy = problems_with_correct / num_problems if num_problems > 0 else 0.0
+        
+        # Compute average correct rate per problem
+        avg_correct_rate = sum(r["num_correct"] / r["num_samples"] for r in all_results) / num_problems if num_problems > 0 else 0.0
+        
+        final_results = {
+            **pass_at_k_results,
+            "overall_accuracy": overall_accuracy,
+            "avg_correct_rate": avg_correct_rate,
+            "total_problems": num_problems,
+            "num_samples_per_problem": num_samples_per_problem,
+            "num_agents": num_agents,
+            "per_problem_results": all_results,
+        }
+        
+        if verbose and self.accelerator.is_main_process:
+            logger.info(f"Evaluation complete:")
+            for k, v in final_results.items():
+                if k != "per_problem_results":
+                    logger.info(f"  {k}: {v}")
+        
+        return final_results
+
+    def _convert_messages_to_string(self, messages: list) -> str:
+        """Convert a list of message dicts to a string using chat template."""
+        if hasattr(self.processing_class, "apply_chat_template"):
+            try:
+                return self.processing_class.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=True
+                )
+            except Exception:
+                pass
+        # Fallback: simple string conversion
+        return "\n".join(f"{m.get('role', 'user')}: {m.get('content', '')}" for m in messages)
+
+    def _generate_eval_single_turn(
+        self, 
+        prompts_as_messages: List[list], 
+        max_completion_length: int
+    ) -> List[str]:
+        """
+        Generate completions for evaluation, handling message-to-string conversion.
+        
+        Args:
+            prompts_as_messages: List of message lists
+            max_completion_length: Maximum tokens to generate
+            
+        Returns:
+            List of decoded completion strings
+        """
+        device = self.accelerator.device
+        
+        # Convert all messages to strings
+        prompts_text = [self._convert_messages_to_string(msgs) for msgs in prompts_as_messages]
+        
+        # Use vLLM if enabled
+        if self.use_vllm:
+            if self.vllm_mode == "colocate" and self.args.vllm_enable_sleep_mode:
+                torch.cuda.empty_cache()
+                self.llm.wake_up()
+            
+            # Sync weights if adapter changed
+            active_adapter = self.model.active_adapter if is_peft_model(self.model) else None
+            need_resync = self.state.global_step != self._last_loaded_step or active_adapter != self._last_loaded_adapter
+            if need_resync:
+                self._move_model_to_vllm(force=True)
+                self._last_loaded_step = self.state.global_step
+            
+            if self.vllm_mode == "colocate":
+                if self.guided_decoding_regex:
+                    guided_decoding = GuidedDecodingParams(regex=self.guided_decoding_regex)
+                else:
+                    guided_decoding = None
+                
+                sampling_params = SamplingParams(
+                    n=1,
+                    repetition_penalty=self.repetition_penalty,
+                    temperature=self.temperature,
+                    top_p=self.top_p,
+                    top_k=-1 if self.top_k is None else self.top_k,
+                    min_p=0.0 if self.min_p is None else self.min_p,
+                    max_tokens=max_completion_length,
+                    truncate_prompt_tokens=self.max_prompt_length,
+                    guided_decoding=guided_decoding,
+                )
+                
+                all_outputs = self.llm.generate(prompts_text, sampling_params=sampling_params, use_tqdm=False)
+                completion_ids = [output.outputs[0].token_ids for output in all_outputs]
+                
+                if self.args.vllm_enable_sleep_mode:
+                    self.llm.sleep(level=1)
+                    
+                decoded = self.processing_class.batch_decode(completion_ids, skip_special_tokens=False)
+            else:
+                # Server mode
+                all_prompts_text = gather_object(prompts_text)
+                
+                if self.accelerator.is_main_process:
+                    output = self.vllm_client.generate(
+                        prompts=all_prompts_text,
+                        n=1,
+                        repetition_penalty=self.repetition_penalty,
+                        temperature=self.temperature,
+                        top_p=self.top_p,
+                        top_k=-1 if self.top_k is None else self.top_k,
+                        min_p=0.0 if self.min_p is None else self.min_p,
+                        max_tokens=max_completion_length,
+                        truncate_prompt_tokens=self.max_prompt_length,
+                        guided_decoding_regex=self.guided_decoding_regex,
+                    )
+                    all_completion_ids = output["completion_ids"]
+                else:
+                    all_completion_ids = None
+                
+                obj_list = [all_completion_ids]
+                broadcast_object_list(obj_list, from_process=0)
+                all_completion_ids = obj_list[0]
+                
+                process_slice = slice(
+                    self.accelerator.process_index * len(prompts_text),
+                    (self.accelerator.process_index + 1) * len(prompts_text),
+                )
+                completion_ids = all_completion_ids[process_slice]
+                decoded = self.processing_class.batch_decode(completion_ids, skip_special_tokens=False)
+        else:
+            # Use transformers generation
+            generate_inputs = self.processing_class(
+                text=prompts_text,
+                return_tensors="pt",
+                padding=True,
+                padding_side="left",
+                max_length=self.max_prompt_length,
+                truncation=True,
+                add_special_tokens=False,
+            )
+            generate_inputs = {k: v.to(device) for k, v in generate_inputs.items()}
+            
+            gen_config_dict = {k: v for k, v in self.generation_config.to_dict().items()}
+            gen_config_dict.pop('max_new_tokens', None)
+            generation_config = GenerationConfig(
+                **gen_config_dict,
+                max_new_tokens=max_completion_length
+            )
+            
+            with torch.no_grad():
+                unwrapped_model = self.accelerator.unwrap_model(self.model)
+                prompt_completion_ids = unwrapped_model.generate(
+                    **generate_inputs, 
+                    generation_config=generation_config
+                )
+            
+            prompt_length = generate_inputs["input_ids"].size(1)
+            completion_ids = prompt_completion_ids[:, prompt_length:]
+            decoded = self.processing_class.batch_decode(completion_ids, skip_special_tokens=False)
+        
+        return decoded
+
+    def _generate_multi_turn_eval_batch(
+        self,
+        problems: List[str],
+        answers: List[str],
+        num_samples: int,
+        num_turns: int,
+        max_completion_length_public: int,
+        max_completion_length_private: int,
+        verbose: bool = True,
+    ) -> List[dict]:
+        """
+        Generate multi-turn completions for a batch of problems and evaluate correctness.
+
+        Args:
+            problems: List of problem strings
+            answers: List of answer strings
+            num_samples: Number of samples to generate per problem
+            num_turns: Total number of turns (public + private)
+            max_completion_length_public: Max tokens for public agent
+            max_completion_length_private: Max tokens for private agent
+            verbose: Whether to print progress
+
+        Returns:
+            List of result dicts, one per problem, containing:
+                - problem: the problem text
+                - answer: the ground truth answer
+                - num_samples: number of samples generated
+                - num_correct: number of correct samples
+                - sample_results: list of (final_answer, is_correct) tuples
+                - trajectories: list of full trajectories for debugging
+        """
+        num_problems = len(problems)
+        num_agents = num_turns // 2
+
+        # Safety check
+        if len(problems) != len(answers):
+            raise ValueError(f"Problems and answers must have same length.")
+
+        # Initialize histories: [num_problems][num_samples] -> list of (agent_name, answer)
+        all_histories = [[[] for _ in range(num_samples)] for _ in range(num_problems)]
+        
+        if verbose and self.accelerator.is_main_process:
+            logger.info(f"Starting evaluation generation: {num_problems} problems, "
+                       f"{num_samples} samples each, {num_turns} turns")
+
+        with torch.no_grad():
+            for turn_idx in range(num_turns):
+                is_public_turn = (turn_idx % 2 == 0)
+                agent_name = "public" if is_public_turn else "private"
+                remaining_agents = num_agents - (turn_idx // 2)
+                
+                # Switch adapter
+                self.accelerator.wait_for_everyone()
+                self._switch_adapter(agent_name, self.model)
+                self.accelerator.wait_for_everyone()
+                
+                # Build prompts for all problem-sample combinations
+                turn_prompts = []
+                for prob_idx, problem in enumerate(problems):
+                    for sample_idx in range(num_samples):
+                        hist = all_histories[prob_idx][sample_idx]
+                        
+                        last_public_output = next(
+                            (out for agent, out in reversed(hist) if agent == "public"), 
+                            None
+                        )
+                        last_private_output = next(
+                            (out for agent, out in reversed(hist) if agent == "private"), 
+                            None
+                        )
+                        
+                        if is_public_turn:
+                            prev_outputs_str = "No previous outputs yet."
+                            formatted_outputs = []
+                            if last_public_output:
+                                formatted_outputs.append(f"Previous Orchestrator Output:\n{last_public_output}")
+                            if last_private_output:
+                                formatted_outputs.append(f"Previous Worker Agent Output:\n{last_private_output}")
+                            if formatted_outputs:
+                                prev_outputs_str = "\n\n".join(formatted_outputs)
+                            
+                            content = PUBLIC_PROMPT.format(
+                                original_problem=problem,
+                                previous_outputs=prev_outputs_str,
+                                num_agents=remaining_agents
+                            )
+                            system_prompt = PUBLIC_SYSTEM_PROMPT
+                        else:
+                            content = PRIVATE_PROMPT.format(
+                                original_problem=problem,
+                                orchestrator_instruction=last_public_output if last_public_output else ""
+                            )
+                            system_prompt = PRIVATE_SYSTEM_PROMPT
+                        
+                        messages = [
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": content}
+                        ]
+                        turn_prompts.append(messages)
+                
+                # Generate completions
+                max_len = max_completion_length_public if is_public_turn else max_completion_length_private
+                
+                self.accelerator.wait_for_everyone()
+                decoded = self._generate_eval_single_turn(turn_prompts, max_len)
+                self.accelerator.wait_for_everyone()
+                
+                # Update histories
+                for i, content in enumerate(decoded):
+                    prob_idx = i // num_samples
+                    sample_idx = i % num_samples
+                    answer = self._extract_answer_content(content)
+                    all_histories[prob_idx][sample_idx].append((agent_name, answer))
+                
+                if verbose and self.accelerator.is_main_process:
+                    logger.info(f"  Turn {turn_idx + 1}/{num_turns} ({agent_name}) completed")
+
+        # Evaluate final answers
+        results = []
+        for prob_idx in range(num_problems):
+            problem = problems[prob_idx]
+            answer = answers[prob_idx]
+
+            sample_results = []
+            trajectories = []
+            num_correct = 0
+
+            for sample_idx in range(num_samples):
+                hist = all_histories[prob_idx][sample_idx]
+                trajectories.append(hist)
+
+                # Get the last private agent's answer
+                final_answer = None
+                for agent, answer in reversed(hist):
+                    if agent == "private":
+                        final_answer = answer
+                        break
+
+                if final_answer is None:
+                    final_answer = hist[-1][1] if hist else ""
+
+                # Check correctness
+                completion_for_reward = [[{"role": "assistant", "content": final_answer}]]
+                try:
+                    reward = accuracy_reward(completions=completion_for_reward, solution=[answer])
+                    is_correct = reward[0] == 1.0 if reward[0] is not None else False
+                except Exception as e:
+                    if verbose and self.accelerator.is_main_process:
+                        logger.warning(f"Error evaluating: {e}")
+                    is_correct = False
+
+                if is_correct:
+                    num_correct += 1
+
+                sample_results.append({
+                    "final_answer": final_answer,
+                    "is_correct": is_correct,
+                })
+            
+            results.append({
+                "problem": problem,
+                "answer": answer,
+                "num_samples": num_samples,
+                "num_correct": num_correct,
+                "sample_results": sample_results,
+                "trajectories": trajectories,
+            })
+        
+        return results
+
+    def run_multi_agent_evaluation(
+        self,
+        eval_dataset: Optional[Union[Dataset, List[dict]]] = None,
+        num_samples_per_problem: int = 10,
+        k_values: List[int] = [1, 5, 10],
+        output_path: Optional[str] = None,
+        **kwargs
+    ) -> dict[str, Any]:
+        """
+        Convenience method to run multi-agent evaluation and optionally save results.
+        
+        Args:
+            eval_dataset: Dataset to evaluate. If None, uses self.eval_dataset
+            num_samples_per_problem: Number of samples per problem for pass@k
+            k_values: List of k values for pass@k metrics
+            output_path: Path to save results as JSON. If None, results are only returned.
+            **kwargs: Additional arguments passed to multi_generate_eval
+            
+        Returns:
+            Evaluation results dictionary
+        """
+        if eval_dataset is None:
+            if self.eval_dataset is None:
+                raise ValueError("No evaluation dataset provided and self.eval_dataset is None")
+            eval_dataset = self.eval_dataset
+        
+        results = self.multi_generate_eval(
+            eval_data=eval_dataset,
+            num_samples_per_problem=num_samples_per_problem,
+            k_values=k_values,
+            **kwargs
+        )
+        
+        if output_path is not None and self.accelerator.is_main_process:
+            import json
+            # Remove non-serializable items for JSON export
+            export_results = {k: v for k, v in results.items() if k != "per_problem_results"}
+            
+            # Add simplified per-problem results
+            export_results["per_problem_summary"] = [
+                {
+                    "problem": r["problem"][:200] + "..." if len(r["problem"]) > 200 else r["problem"],
+                    "num_correct": r["num_correct"],
+                    "num_samples": r["num_samples"],
+                    "accuracy": r["num_correct"] / r["num_samples"]
+                }
+                for r in results["per_problem_results"]
+            ]
+            
+            with open(output_path, "w") as f:
+                json.dump(export_results, f, indent=2)
+            logger.info(f"Results saved to {output_path}")
+        
+        return results
+
+    def _collect_completions_for_json(
+        self,
+        problems: List[str],
+        answers: List[str],
+        completions_per_trajectory: List[List],
+        rewards_per_trajectory: torch.Tensor,
+        acc_scores: Optional[torch.Tensor] = None,
+        format_rewards: Optional[torch.Tensor] = None,
+    ):
+        """
+        Collect completion data for JSON saving.
+        This method is called from _generate_and_score_completions.
+        
+        Args:   
+            problems: List of problem texts
+            answers: List of answer texts
+            completions_per_trajectory: List of trajectories, each containing turns
+            rewards_per_trajectory: Tensor of rewards for each trajectory
+            acc_scores: Tensor of accuracy scores (optional)
+            format_rewards: Tensor of format rewards (optional)
+        """
+        num_samples = len(problems)
+        
+        for sample_idx in range(num_samples):
+            sample_data = {
+                "step": self.state.global_step,
+                "problem": problems[sample_idx],
+                "answer": answers[sample_idx],
+                "generations": []
+            }
+            
+            for gen_idx in range(self.num_generations):
+                traj_idx = sample_idx * self.num_generations + gen_idx
+                
+                # Safety check for trajectory index
+                if traj_idx >= len(completions_per_trajectory):
+                    logger.warning(f"Trajectory index {traj_idx} out of bounds, skipping")
+                    continue
+                    
+                traj_content = completions_per_trajectory[traj_idx]
+                
+                generation_data = {
+                    "generation_idx": gen_idx,
+                    "reward": rewards_per_trajectory[traj_idx].item() if traj_idx < len(rewards_per_trajectory) else 0.0,
+                    "turns": []
+                }
+                
+                # Add accuracy and format rewards if available (use the tensors directly)
+                if acc_scores is not None and traj_idx < len(acc_scores):
+                    generation_data["accuracy_reward"] = acc_scores[traj_idx].item()
+                if format_rewards is not None and traj_idx < len(format_rewards):
+                    generation_data["format_reward"] = format_rewards[traj_idx].item()
+                
+                # Extract turn information
+                for turn_idx, turn_data in enumerate(traj_content):
+                    agent = "public" if turn_idx % 2 == 0 else "private"
+                    
+                    if isinstance(turn_data, list) and len(turn_data) > 0 and isinstance(turn_data[0], dict):
+                        text = turn_data[0].get("content", "")
+                    else:
+                        text = str(turn_data)
+                    
+                    turn_info = {
+                        "turn_idx": turn_idx,
+                        "agent": agent,
+                        "completion": text
+                    }
+                    generation_data["turns"].append(turn_info)
+                
+                sample_data["generations"].append(generation_data)
+            
+            self._completions_to_save.append(sample_data)
+    
+    def _save_completions_to_json(self, force: bool = False):
+        """
+        Save collected completions to a single JSON file.
+        Appends new completions to existing file if it exists.
+        Called periodically during training.
+        
+        Args:
+            force: If True, save even if buffer is small
+        """
+        if not self.save_completions or not self.accelerator.is_main_process:
+            return
+        
+        if not self._completions_to_save:
+            return
+        
+        # Save every logging step or when forced (at least 1 sample)
+        if not force and len(self._completions_to_save) < 1:
+            return
+        
+        import json
+        from datetime import datetime
+        
+        # Ensure directory exists
+        os.makedirs(self.save_completions_path, exist_ok=True)
+        
+        # Use a single file for all completions
+        filename = "all_completions.json"
+        filepath = os.path.join(self.save_completions_path, filename)
+        
+        # Load existing data if file exists
+        existing_data = {"metadata": {}, "completions": []}
+        if os.path.exists(filepath):
+            try:
+                with open(filepath, "r", encoding="utf-8") as f:
+                    existing_data = json.load(f)
+            except (json.JSONDecodeError, IOError) as e:
+                logger.warning(f"Could not load existing completions file, starting fresh: {e}")
+                existing_data = {"metadata": {}, "completions": []}
+        
+        # Append new completions
+        existing_data["completions"].extend(self._completions_to_save)
+        
+        # Update metadata
+        step = self.state.global_step
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        existing_data["metadata"] = {
+            "last_updated_step": step,
+            "last_updated_timestamp": timestamp,
+            "total_samples": len(existing_data["completions"]),
+            "num_generations": self.num_generations,
+            "num_turns": self.num_turns,
+            "num_agents": self.num_agents,
+            "model_name": getattr(self.model.config, "_name_or_path", "unknown"),
+        }
+        
+        try:
+            with open(filepath, "w", encoding="utf-8") as f:
+                json.dump(existing_data, f, ensure_ascii=False, indent=2)
+            logger.info(f"Saved {len(self._completions_to_save)} completions to {filepath} (total: {len(existing_data['completions'])})")
+        except Exception as e:
+            logger.error(f"Failed to save completions to JSON: {e}")
+        
+        # Clear the buffer after saving
+        self._completions_to_save.clear()
         

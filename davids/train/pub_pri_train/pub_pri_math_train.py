@@ -2,6 +2,7 @@ import os
 import re
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict
+import re
 
 import torch
 from datasets import load_dataset
@@ -38,6 +39,15 @@ class PUBPRIGRPOConfig(GRPOConfig):
     public_agent_max_completion_length: int=field(
         default=512,
         metadata={"help": "Maximum completion length for the public agent"},
+    )
+    
+    save_completions: bool = field(
+        default=True,
+        metadata={"help": "Save completions to JSON file"},
+    )
+    save_completions_path: str = field(
+        default=None,
+        metadata={"help": "Path to save completions"},
     )
 
 if __name__ == "__main__":
@@ -109,25 +119,25 @@ if __name__ == "__main__":
     print(f"Train dataset loaded: {len(train_dataset)} samples", file=sys.stderr, flush=True)
     logger.info(f"Train dataset loaded: {len(train_dataset)} samples")
     
-    print("Filtering train dataset...", file=sys.stderr, flush=True)
-    train_dataset = train_dataset.filter(lambda x: x["level"] in ("Level 3", "Level 4", "Level 5"))
-    print(f"Train dataset after filtering: {len(train_dataset)} samples", file=sys.stderr, flush=True)
+    # print("Filtering train dataset...", file=sys.stderr, flush=True)
+    # train_dataset = train_dataset.filter(lambda x: x["level"] in ("Level 3", "Level 4", "Level 5"))
+    # print(f"Train dataset after filtering: {len(train_dataset)} samples", file=sys.stderr, flush=True)
     
     train_dataset = train_dataset.shuffle(seed=training_args.seed)
-    print("Loading eval dataset...", file=sys.stderr, flush=True)
-    
-    eval_dataset = load_dataset(script_args.dataset_name, split="test")
-    print(f"Eval dataset loaded: {len(eval_dataset)} samples", file=sys.stderr, flush=True)
-    eval_dataset = eval_dataset.filter(lambda x: x["level"] in ("Level 3", "Level 4", "Level 5"))
-    print(f"Eval dataset after filtering: {len(eval_dataset)} samples", file=sys.stderr, flush=True)
-    eval_dataset = eval_dataset.shuffle(seed=training_args.seed)
     
     def filter_columns(example):
-        return {"problem": example["problem"], "answer": example["answer"]}
+
+        answer = example["answer"]
+        # Find all occurrences of \boxed{...}
+        boxed_vals = re.findall(r'\\boxed\{([^\}]*)\}', answer)
+        # Use only the value(s) inside \boxed{...} (if any), else the original answer
+        answer = boxed_vals[0] if boxed_vals else answer
+        
+        return {"problem": example["problem"], "answer": answer}
 
     print("Mapping datasets to filter columns...", file=sys.stderr, flush=True)
     train_dataset = train_dataset.map(filter_columns)
-    eval_dataset = eval_dataset.map(filter_columns)
+    # eval_dataset = eval_dataset.map(filter_columns)
     print("Dataset preparation completed", file=sys.stderr, flush=True)
 
     ################
@@ -142,6 +152,8 @@ if __name__ == "__main__":
                                                 dtype=dtype)
     print("Base model loaded successfully", file=sys.stderr, flush=True)
     logger.info("Base model loaded successfully")
+    
+    
     
     print("STEP 3: Setting up PEFT adapters...", file=sys.stderr, flush=True)
     model = get_peft_model(base_model, base_peft_config, adapter_name="public")
@@ -158,7 +170,7 @@ if __name__ == "__main__":
         args=training_args,
         reward_funcs=[think_answer_format_reward, accuracy_reward],
         train_dataset=train_dataset,
-        eval_dataset=eval_dataset,
+        eval_dataset=None,
         peft_config=None,  # Already a PeftModel, so pass None to avoid merge_and_unload
     )
     print("PUBPRIGRPOTrainer created successfully", file=sys.stderr, flush=True)
@@ -172,6 +184,6 @@ if __name__ == "__main__":
     logger.info("Training completed")
 
     # Save and push to hub
-    trainer.save_model(training_args.output_dir)
+    trainer.save_model(training_args.output_dir+"/"+"pub_pri_math_trainer")
     if training_args.push_to_hub:
         trainer.push_to_hub(dataset_name=script_args.dataset_name.split("/")[-1], model_name=training_args.run_name)

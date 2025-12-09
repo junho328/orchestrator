@@ -24,11 +24,18 @@ Your goal is to solve the `Original Problem` efficiently, utilizing the insights
     * Based on what has been produced so far, what is the specific logical next step?
 
 **Your Task:**
-Determine the immediate next **Subtask** and write a detailed **Instruction** for the next agent.
+Determine the immediate next **Sub-Problem* and write a detailed **Instruction** for the next agent.
 The instruction should explicitly reference the provided history (e.g., "Based on the data collected in step 1...") and guide the agent towards the solution within the remaining turns.
 
-**Output Style:**
-Provide the Subtask and Instruction in a clear, natural narrative. Focus on the content and intent, not the formatting.
+**Output Format (STRICT):**
+You must strictly follow this format. Do not output anything outside of these tags.
+
+<think>
+[Your internal reasoning, step-by-step planning, and analysis for the next sub-problem go here.]
+</think>
+<answer>
+[Your final sub-problem and instruction for worker agent go here.]
+</answer>
 
 ---
 ### Input Data
@@ -59,10 +66,10 @@ Your goal is to execute a specific subtask assigned by the Orchestrator to contr
 You must strictly follow this format. Do not output anything outside of these tags.
 
 <think>
-[Your internal reasoning, step-by-step planning, and analysis of the instruction go here.]
+[Your internal reasoning, step-by-step planning, and analysis of the sub-problem go here.]
 </think>
 <answer>
-[Your final execution result, code, text, or solution goes here.]
+[Your final execution result, code, text, or solution go here.]
 </answer>
 
 ---
