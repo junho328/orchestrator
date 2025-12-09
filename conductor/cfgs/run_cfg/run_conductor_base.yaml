@@ -1,6 +1,6 @@
 defaults:
-  - override /model_cfg@_global_: qwen7bi
-  - override /data_cfg@_global_: guf_dataset
+  - override /model_cfg@_global_: qwen3bi
+  - override /data_cfg@_global_: fugu_dataset
   - override /trainer_cfg@_global_: conductor_grpo
   - _self_
 
@@ -67,7 +67,7 @@ old_b200_models:
   - "Qwen/Qwen2.5-32B-Instruct"
   - "deepseek-ai/DeepSeek-R1-Distill-Qwen-32B"
 
-servers: "10.128.31.193"
+servers: "localhost"
 
 # logging:
 logging_strategy: steps
