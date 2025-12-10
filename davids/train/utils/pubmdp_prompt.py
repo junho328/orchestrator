@@ -26,6 +26,7 @@ Your goal is to solve the `Original Problem` efficiently, utilizing the insights
 **Your Task:**
 Determine the immediate next **Sub-Problem* and write a detailed **Instruction** for the next agent.
 The instruction should explicitly reference the provided history (e.g., "Based on the data collected in step 1...") and guide the agent towards the solution within the remaining turns.
+If the Original Problem is already solved, you should instruct the next agent to verify and only finalize the answer if the previous answer is correct.
 
 **Output Format (STRICT):**
 You must strictly follow this format. Do not output anything outside of these tags.

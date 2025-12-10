@@ -71,7 +71,7 @@ from trl.trainer.utils import (
 
 # User defined prompts and rewards
 from davids.train.utils.pubmdp_prompt import PUBLIC_PROMPT, PRIVATE_PROMPT, PUBLIC_SYSTEM_PROMPT, PRIVATE_SYSTEM_PROMPT
-from davids.reward_utils.math_reward import accuracy_reward
+from davids.reward_utils.math_grader import answer_tag_reward_fn
 from davids.reward_utils.think_answer_format_reward import think_answer_format_reward
 
 from peft import PeftConfig, PeftModel
@@ -468,6 +468,7 @@ class PUBPRIGRPOTrainer(BaseTrainer):
             "completion": deque(maxlen=log_buffer_size),
             "rewards": defaultdict(lambda: deque(maxlen=log_buffer_size)),
             "advantages": deque(maxlen=log_buffer_size),
+            "turn_info": deque(maxlen=log_buffer_size),  # Store turn_info for table logging
         }
         self._trajectory_buffer = []
         
@@ -1242,35 +1243,19 @@ class PUBPRIGRPOTrainer(BaseTrainer):
 
         answers = [example.get("answer", "") for example in inputs for _ in range(self.num_generations)]
 
-        def _to_message(turn) -> list[dict[str, str]]:
-            # Normalize any turn (str | dict | list) into a single assistant message for reward functions
-            if isinstance(turn, list):
-                if turn and isinstance(turn[0], dict) and "content" in turn[0]:
-                    text = turn[0]["content"]
-                else:
-                    # Flatten any nested values into a string
-                    text = " ".join(
-                        t.get("content", "") if isinstance(t, dict) else str(t)  # type: ignore[arg-type]
-                        for t in turn
-                    )
-            elif isinstance(turn, dict) and "content" in turn:
-                text = turn["content"]
-            else:
-                text = str(turn)
-            return [{"role": "assistant", "content": text}]
-
         # Accuracy on the last turn of each trajectory
-        acc_inputs = [_to_message(traj[-1]) for traj in completions_per_trajectory]
-        acc_scores_list = accuracy_reward(completions=acc_inputs, solution=answers)
+        acc_inputs = [traj[-1]for traj in completions_per_trajectory]
+        
+        acc_scores_list = answer_tag_reward_fn(completions=acc_inputs, solution=answers)
         acc_scores = torch.tensor(
-            [score if score is not None else 0.0 for score in acc_scores_list],
+            [score for score in acc_scores_list],
             dtype=torch.float32,
             device=device,
         )
 
         # Format check on every turn of every trajectory
-        flat_messages = [_to_message(turn) for traj in completions_per_trajectory for turn in traj]
-        flat_fmt_scores = think_answer_format_reward(flat_messages)
+        flat_messages = [turn for traj in completions_per_trajectory for turn in traj]
+        flat_fmt_scores = think_answer_format_reward(completions=flat_messages)
         flat_fmt_tensor = torch.tensor(flat_fmt_scores, dtype=torch.float32, device=device)
 
         num_turns = len(completions_per_trajectory[0])
@@ -2049,26 +2034,31 @@ class PUBPRIGRPOTrainer(BaseTrainer):
 
         # Calculate mean reward per function, but only for samples where the function was applied (non-NaN values)
         # Note: rewards_per_func is now (num_turns, 1) shape, so we need to handle it differently
-        if rewards_per_func.dim() == 2 and rewards_per_func.size(1) == 1:
-            # Single reward function case
-            mean_rewards = torch.nanmean(rewards_per_func.squeeze(1)).item()
-            for reward_func_name in self.reward_func_names:
-                self._metrics[mode][f"rewards/{reward_func_name}/mean"].append(mean_rewards)
-                self._metrics[mode][f"rewards/{reward_func_name}/std"].append(mean_std_log)
-        else:
-            for i, reward_func_name in enumerate(self.reward_func_names):
-                if rewards_per_func.size(1) > i:
-                    mean_rewards = torch.nanmean(rewards_per_func[:, i]).item()
-                    self._metrics[mode][f"rewards/{reward_func_name}/mean"].append(mean_rewards)
-                    std_func_rewards = nanstd(rewards_per_func[:, i]).item()
-                    self._metrics[mode][f"rewards/{reward_func_name}/std"].append(std_func_rewards)
-        self._metrics[mode]["reward"].append(mean_grouped_rewards_log)
-        self._metrics[mode]["reward_std"].append(mean_std_log)
-        self._metrics[mode]["frac_reward_zero_std"].append(is_std_zero.float().mean().item())
+        # if rewards_per_func.dim() == 2 and rewards_per_func.size(1) == 1:
+        #     # Single reward function case
+        #     mean_rewards = torch.nanmean(rewards_per_func.squeeze(1)).item()
+        #     for reward_func_name in self.reward_func_names:
+        #         self._metrics[mode][f"rewards/{reward_func_name}/mean"].append(mean_rewards)
+        #         self._metrics[mode][f"rewards/{reward_func_name}/std"].append(mean_std_log)
+        # else:
+        #     for i, reward_func_name in enumerate(self.reward_func_names):
+        #         if rewards_per_func.size(1) > i:
+        #             mean_rewards = torch.nanmean(rewards_per_func[:, i]).item()
+        #             self._metrics[mode][f"rewards/{reward_func_name}/mean"].append(mean_rewards)
+        #             std_func_rewards = nanstd(rewards_per_func[:, i]).item()
+        #             self._metrics[mode][f"rewards/{reward_func_name}/std"].append(std_func_rewards)
+        # self._metrics[mode]["reward"].append(mean_grouped_rewards_log)
+        # self._metrics[mode]["reward_std"].append(mean_std_log)
+        # self._metrics[mode]["frac_reward_zero_std"].append(is_std_zero.float().mean().item())
 
         # Log prompt and completion texts
-        self._logs["prompt"].extend(gather_object(prompts_text))
-        self._logs["completion"].extend(gather_object(completions_text))
+        gathered_prompts = gather_object(prompts_text)
+        gathered_completions = gather_object(completions_text)
+        gathered_turn_info = gather_object(turn_info)
+        
+        self._logs["prompt"].extend(gathered_prompts)
+        self._logs["completion"].extend(gathered_completions)
+        self._logs["turn_info"].extend(gathered_turn_info)
         # Log rewards
         if rewards_per_func.dim() == 2 and rewards_per_func.size(1) == 1:
             # Single reward function case
@@ -2466,135 +2456,106 @@ class PUBPRIGRPOTrainer(BaseTrainer):
             logs = {**logs, **metrics}
             self._metrics[mode].clear()
 
-        # 2. Completions 및 Trajectory 로깅 (log_completions=True 일 때만)
-        # 중요: gather_object는 모든 프로세스에서 호출되어야 함 (데드락 방지)
+        # 2. Completions 및 Trajectory 로깅 준비
+        # gather_object는 데드락 방지를 위해 모든 프로세스에서 실행
         all_trajectories = gather_object(self._trajectory_buffer) if hasattr(self, "_trajectory_buffer") else []
-        # 로깅 후 버퍼 비우기 (메모리 누수 방지)
+        
+        # 로깅 후 버퍼 비우기
         if hasattr(self, "_trajectory_buffer"):
             self._trajectory_buffer.clear()
 
         # 메인 프로세스에서만 WandB 로깅 수행
         if self.accelerator.is_main_process:
             if self.log_completions:
-                # WandB가 초기화되어 있는지 확인
-                if self.args.report_to and "wandb" in self.args.report_to:
-                    import pandas as pd
-                    if wandb.run is None:
-                        logger.warning("WandB run is not active. Skipping table logging.")
-                    else:
-                        # (A) Per-Turn Completions Table 로깅 (각 턴별 상세 정보)
-                        if len(self._logs["prompt"]) > 0:
-                            prompt_list = list(self._logs["prompt"])
-                            completion_list = list(self._logs["completion"])
-                            advantage_list = list(self._logs["advantages"])
-                            # rewards는 dict of deques -> 리스트로 변환 후 길이 체크
-                            rewards_dict = {k: list(v) for k, v in self._logs["rewards"].items()}
+                if self.args.report_to and "wandb" in self.args.report_to and wandb.run is not None:
+                    # (A) Per-Turn Completions Table
+                    if len(self._logs["prompt"]) > 0:
+                        prompt_list = list(self._logs["prompt"])
+                        completion_list = list(self._logs["completion"])
+                        advantage_list = list(self._logs["advantages"])
+                        turn_info_list = list(self._logs["turn_info"])
+                        rewards_dict = {k: list(v) for k, v in self._logs["rewards"].items()}
 
-                            # 모든 컬럼 길이 중 최소값으로 절삭 (길이 불일치로 인한 Table 실패 방지)
-                            column_lengths = [
-                                len(prompt_list),
-                                len(completion_list),
-                                len(advantage_list),
-                            ]
-                            # rewards_dict 값들 중 비어있지 않은 것만 체크
-                            for v in rewards_dict.values():
-                                if len(v) > 0:
-                                    column_lengths.append(len(v))
-                            
-                            min_len = min(column_lengths) if column_lengths else 0
+                        column_lengths = [len(prompt_list), len(completion_list), len(advantage_list), len(turn_info_list)]
+                        for v in rewards_dict.values():
+                            if len(v) > 0: column_lengths.append(len(v))
+                        
+                        min_len = min(column_lengths) if column_lengths else 0
 
-                            if min_len == 0:
-                                logger.info("Skipping completions table logging: empty columns after trimming.")
-                            else:
-                                table_data = {
-                                    "step": [self.state.global_step] * min_len,
-                                    "prompt": prompt_list[:min_len],
-                                    "completion": completion_list[:min_len],
-                                    "advantage": advantage_list[:min_len],
-                                }
-
-                                for reward_key, reward_vals in rewards_dict.items():
-                                    if len(reward_vals) >= min_len:
-                                        table_data[f"reward_{reward_key}"] = reward_vals[:min_len]
-
-                                # Images 추가 (존재 시, 길이 맞춰 절삭)
-                                if self._logs["images"]:
-                                    images_list = list(self._logs["images"])
-                                    if len(images_list) >= min_len:
-                                        table_data["images"] = [
-                                            [wandb.Image(img) for img in images] if images else []
-                                            for images in images_list[:min_len]
-                                        ]
-
-                                try:
-                                    df = pd.DataFrame(table_data)
-                                    if self.wandb_log_unique_prompts:
-                                        df = df.drop_duplicates(subset=["prompt"])
-                                    
-                                    # 누적 테이블로 저장 (step별로 덮어쓰지 않음)
-                                    table = wandb.Table(dataframe=df)
-                                    wandb.log({f"completions/step_{self.state.global_step}": table})
-                                    
-                                    logger.info(
-                                        "Logged completions table with %s rows at step %s",
-                                        len(df),
-                                        self.state.global_step,
-                                    )
-                                except Exception as e:
-                                    logger.error(f"Failed to log completions table: {e}", exc_info=True)
-
-                        # (B) Trajectories Table 로깅 (각 샘플의 전체 궤적 정보)
-                        if all_trajectories:
-                            try:
-                                # Flatten nested lists from gather_object
-                                flat_trajectories = []
-                                for item in all_trajectories:
-                                    if isinstance(item, list):
-                                        flat_trajectories.extend(item)
-                                    elif isinstance(item, dict):
-                                        flat_trajectories.append(item)
-                                
-                                if flat_trajectories:
-                                    df_traj = pd.DataFrame(flat_trajectories)
-                                    # Sort by step, sample_idx, generation_idx for readability
-                                    sort_cols = [c for c in ["step", "sample_idx", "generation_idx"] if c in df_traj.columns]
-                                    if sort_cols:
-                                        df_traj = df_traj.sort_values(sort_cols)
-                                    
-                                    # 누적 테이블로 저장 (step별로 덮어쓰지 않음)
-                                    traj_table = wandb.Table(dataframe=df_traj)
-                                    wandb.log({f"trajectories/step_{self.state.global_step}": traj_table})
-                                    
-                                    logger.info(
-                                        "Logged trajectories table with %s rows at step %s",
-                                        len(df_traj),
-                                        self.state.global_step,
-                                    )
+                        if min_len > 0:
+                            # ... (데이터 가공 로직 동일) ...
+                            sample_indices, generation_indices, turn_indices, agent_names = [], [], [], []
+                            for info in turn_info_list[:min_len]:
+                                if isinstance(info, (list, tuple)) and len(info) >= 4:
+                                    agent_names.append(str(info[0]))
+                                    turn_indices.append(int(info[1]))
+                                    sample_indices.append(int(info[2]))
+                                    generation_indices.append(int(info[3]))
                                 else:
-                                    logger.warning(f"No valid trajectory entries to log at step {self.state.global_step}")
-                            except Exception as e:
-                                logger.error(f"Failed to log trajectories table: {e}", exc_info=True)
-                        else:
-                            logger.debug(f"all_trajectories is empty at step {self.state.global_step}")
-            else:
-                # 디버깅을 위해 한 번만 경고 (선택 사항)
-                if self.state.global_step <= self.args.logging_steps:
-                    logger.info("log_completions is False. Tables will not be logged.")
+                                    agent_names.append("unknown"); turn_indices.append(-1); sample_indices.append(-1); generation_indices.append(-1)
 
-        # 3. JSON 파일로 completions 저장 (main process only)
+                            table_data = {
+                                "step": [self.state.global_step] * min_len,
+                                "sample_idx": sample_indices,
+                                "generation_idx": generation_indices,
+                                "turn_idx": turn_indices,
+                                "agent": agent_names,
+                                "prompt": prompt_list[:min_len],
+                                "completion": completion_list[:min_len],
+                                "advantage": advantage_list[:min_len],
+                            }
+                            for r_k, r_v in rewards_dict.items():
+                                if len(r_v) >= min_len: table_data[f"reward_{r_k}"] = r_v[:min_len]
+
+                            if self._logs["images"]:
+                                images_list = list(self._logs["images"])
+                                if len(images_list) >= min_len:
+                                    table_data["images"] = [[wandb.Image(img) for img in imgs] if imgs else [] for imgs in images_list[:min_len]]
+
+                            try:
+                                import pandas as pd
+                                df = pd.DataFrame(table_data)
+                                if self.wandb_log_unique_prompts:
+                                    df = df.drop_duplicates(subset=["prompt", "turn_idx", "sample_idx", "generation_idx"])
+
+                                table = wandb.Table(dataframe=df)
+                                
+                                # [FIX] Key 이름을 고정하고, commit=False를 사용하여 HF 로그와 병합
+                                wandb.log({"generation_log/completions": table}, step=self.state.global_step, commit=False)
+                                
+                            except Exception as e:
+                                logger.error(f"Failed to log completions table: {e}", exc_info=True)
+
+                    # (B) Trajectories Table
+                    if all_trajectories:
+                        try:
+                            import pandas as pd
+                            flat_trajectories = []
+                            for item in all_trajectories:
+                                if isinstance(item, list): flat_trajectories.extend(item)
+                                elif isinstance(item, dict): flat_trajectories.append(item)
+                            
+                            if flat_trajectories:
+                                df_traj = pd.DataFrame(flat_trajectories)
+                                traj_table = wandb.Table(dataframe=df_traj)
+                                
+                                # [FIX] Key 이름을 고정하고, commit=False 사용
+                                wandb.log({"generation_log/trajectories": traj_table}, step=self.state.global_step, commit=False)
+                        except Exception as e:
+                            logger.error(f"Failed to log trajectories table: {e}", exc_info=True)
+
+        # 3. JSON 저장 (기존 유지)
         if self.accelerator.is_main_process:
             self._save_completions_to_json(force=False)
         
-        # 4. _logs 버퍼 클리어 (메모리 누수 방지)
+        # 4. _logs 버퍼 클리어 (기존 유지)
         for key in self._logs:
-            if isinstance(self._logs[key], deque):
-                self._logs[key].clear()
+            if isinstance(self._logs[key], deque): self._logs[key].clear()
             elif isinstance(self._logs[key], dict):
                 for sub_key in self._logs[key]:
-                    if isinstance(self._logs[key][sub_key], deque):
-                        self._logs[key][sub_key].clear()
-        
-        # 5. 부모 클래스의 log 호출 (WandBCallback 등 트리거)
+                    if isinstance(self._logs[key][sub_key], deque): self._logs[key][sub_key].clear()
+
+        # 5. 부모 클래스 log 호출 (여기서 최종 commit=True가 발생하여 위 테이블과 메트릭이 함께 업로드됨)
         super().log(logs, start_time)
 
     # Ensure the model card is saved along with the checkpoint
@@ -2636,10 +2597,17 @@ class PUBPRIGRPOTrainer(BaseTrainer):
         
     def _extract_answer_content(self, content: str) -> str:
         """Extract content between <answer> and </answer> tags."""
-        match = re.search(r'<answer>(.*?)</answer>', content, re.DOTALL)
-        if match:
-            return match.group(1).strip()
-        return content
+        
+        if "<answer>" in content:
+            if "</answer>" in content:
+                model_answer = content.split("<answer>")[-1].replace("</answer>", "")
+            else:
+                model_answer = content.split("<answer>")[-1]
+        else:
+            input_size = self.max_prompt_length // 2
+            model_answer = content[-input_size:]    
+        
+        return model_answer
         
     def training_step(self, model, inputs, num_items_in_batch=None):
         model.train()
@@ -3082,7 +3050,7 @@ class PUBPRIGRPOTrainer(BaseTrainer):
                 # Check correctness
                 completion_for_reward = [[{"role": "assistant", "content": final_answer}]]
                 try:
-                    reward = accuracy_reward(completions=completion_for_reward, solution=[answer])
+                    reward = answer_tag_reward_fn(completions=completion_for_reward, solution=[answer])
                     is_correct = reward[0] == 1.0 if reward[0] is not None else False
                 except Exception as e:
                     if verbose and self.accelerator.is_main_process:

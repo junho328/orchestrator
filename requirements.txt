@@ -20,4 +20,5 @@ pydantic
 tqdm 
 nvidia-ml-py
 liger-kernel
+pylatexenc
 

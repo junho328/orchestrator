@@ -21,7 +21,7 @@ from transformers import AutoModelForCausalLM
 from davids.train.pub_pri_train.pub_pri_grpo_trainer import PUBPRIGRPOTrainer
 from davids.train.pub_pri_train.grpo_config import GRPOConfig
 from davids.reward_utils.think_answer_format_reward import think_answer_format_reward
-from davids.reward_utils.math_reward import accuracy_reward
+from davids.reward_utils.math_grader import answer_tag_reward_fn
 
 @dataclass
 class PUBPRIGRPOConfig(GRPOConfig):
@@ -127,13 +127,7 @@ if __name__ == "__main__":
     
     def filter_columns(example):
 
-        answer = example["answer"]
-        # Find all occurrences of \boxed{...}
-        boxed_vals = re.findall(r'\\boxed\{([^\}]*)\}', answer)
-        # Use only the value(s) inside \boxed{...} (if any), else the original answer
-        answer = boxed_vals[0] if boxed_vals else answer
-        
-        return {"problem": example["problem"], "answer": answer}
+        return {"problem": example["problem"], "answer": example["answer"]}
 
     print("Mapping datasets to filter columns...", file=sys.stderr, flush=True)
     train_dataset = train_dataset.map(filter_columns)
@@ -168,7 +162,7 @@ if __name__ == "__main__":
     trainer = PUBPRIGRPOTrainer(
         model=model,
         args=training_args,
-        reward_funcs=[think_answer_format_reward, accuracy_reward],
+        reward_funcs=[think_answer_format_reward, answer_tag_reward_fn],
         train_dataset=train_dataset,
         eval_dataset=None,
         peft_config=None,  # Already a PeftModel, so pass None to avoid merge_and_unload

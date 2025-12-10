@@ -15,7 +15,7 @@
 import re
 
 
-def think_answer_format_reward(completions: list[list[dict[str, str]]], **kwargs) -> list[float]:
+def think_answer_format_reward(completions, **kwargs):
     r"""
     Reward function that checks if the reasoning process and final answer are enclosed within `"<think>"` and `"</think>"` tags and `"<answer>"` and `"</answer>"` tags respectively. The
     function returns a reward of 0.5 if the format is correct, otherwise 0.0.
@@ -33,6 +33,6 @@ def think_answer_format_reward(completions: list[list[dict[str, str]]], **kwargs
             A list of rewards, where each reward is 0.5 if the completion matches the expected format, otherwise 0.0.
     """
     pattern = r"^<think>(?!.*<think>)(.*?)</think>.*<answer>(?!.*<answer>)(.*?)</answer>.*$"
-    completion_contents = [completion[0]["content"] for completion in completions]
+    completion_contents = [completion for completion in completions]
     matches = [re.match(pattern, content, re.DOTALL | re.MULTILINE) for content in completion_contents]
     return [0.5 if match else 0.0 for match in matches]
